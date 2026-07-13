@@ -15,7 +15,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends tini \
 WORKDIR /app
 
 RUN pip install --no-cache-dir \
-      "fastmcp>=2.10" "uvicorn[standard]" httpx pydantic \
+      "fastmcp>=3.4,<4" "uvicorn[standard]" httpx pydantic \
       "psycopg[binary]" psycopg-pool
 
 COPY brain/merita ./merita
