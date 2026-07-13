@@ -138,8 +138,15 @@ class Facilitator:
     def __init__(self, auth: OkxAuth | None = None) -> None:
         self._auth = auth or OkxAuth()
         self._c = httpx.AsyncClient(base_url=FACILITATOR, timeout=30.0)
-        self.token = Token(address=_DEFAULT_TOKEN, symbol="USDT")
-        self.token_discovered = False
+        # An OPERATOR ASSERTION, not a discovery. See check_supported() for why there is no
+        # honest way to discover this. Overridable by env so a wrong guess is a config change,
+        # not a redeploy of code.
+        self.token = Token(
+            address=os.environ.get("MERITA_SETTLEMENT_ASSET", _DEFAULT_TOKEN),
+            symbol=os.environ.get("MERITA_SETTLEMENT_SYMBOL", "USDT"),
+            decimals=int(os.environ.get("MERITA_SETTLEMENT_DECIMALS", "6")),
+        )
+        self.supported = False
 
     @property
     def configured(self) -> bool:
@@ -147,53 +154,43 @@ class Facilitator:
 
     # ── Boot-time discovery ─────────────────────────────────────────────────
 
-    async def discover_token(self, symbol: str = "USDT") -> Token:
+    async def check_supported(self) -> bool:
         """
-        Ask the facilitator which assets it will actually settle on X Layer.
+        Confirm the facilitator will settle `exact` on X Layer, and log what it offers.
 
-        This is the only source of truth that cannot be stale, because it IS the thing doing
-        the settling. Three OKX-authored docs give three different USDT addresses; rather than
-        adjudicate between them, we ask the referee. (There is a pleasing symmetry in a
-        verification service refusing to trust unverified inputs about itself.)
+        NOTE WHAT THIS DOES *NOT* DO: it does not discover the token address.
 
-        If the probe fails we keep the fallback and log LOUDLY. We do not crash: a facilitator
-        blip at boot should not take the service down, and a wrong-but-flagged token is
-        recoverable, whereas a dead service during OKX's 24h review window is not.
+        I assumed /supported would list assets. It does not — it advertises NETWORKS and
+        SCHEMES only:
+            {"network":"eip155:196","scheme":"exact","x402Version":2}
+            {"network":"eip155:196","scheme":"exact","extra":{"assetTransferMethod":"permit2"}}
+        There is no asset field, anywhere, by design: in x402 the SELLER declares the asset in
+        the 402 challenge and the facilitator settles whatever the buyer validly signed for.
+        The token address is our assertion to make, not theirs to publish.
+
+        Which means the address below IS a hardcoded constant and there is no clever way out
+        of that. So it gets verified the only way a constant like this can be: by a human,
+        against the explorer, once — and then loudly surfaced on /health forever after, so
+        nobody can forget it is an assumption. See MERITA_SETTLEMENT_ASSET.
         """
         path = "/api/v6/pay/x402/supported"
         try:
             r = await self._c.get(path, headers=self._auth.headers("GET", path, ""))
             j = r.json()
-            kinds = (j.get("data") or {}).get("kinds") or j.get("data") or []
-
-            for k in kinds if isinstance(kinds, list) else []:
-                if k.get("network") != NETWORK:
-                    continue
-                for asset in k.get("assets", []) or [k]:
-                    sym = (asset.get("symbol") or asset.get("name") or "").upper()
-                    addr = asset.get("asset") or asset.get("address")
-                    if sym == symbol.upper() and addr:
-                        self.token = Token(
-                            address=addr,
-                            symbol=sym,
-                            decimals=int(asset.get("decimals", 6)),
-                            eip712_version=str((asset.get("extra") or {}).get("version", "1")),
-                        )
-                        self.token_discovered = True
-                        log.info("facilitator: %s on X Layer = %s (%dd)",
-                                 sym, addr, self.token.decimals)
-                        return self.token
-
-            log.error(
-                "facilitator /supported did not list %s on %s. Falling back to %s — VERIFY "
-                "THIS ON THE EXPLORER before taking real payments. Raw: %s",
-                symbol, NETWORK, _DEFAULT_TOKEN, str(j)[:300],
+            kinds = (j.get("data") or {}).get("kinds") or []
+            ok = any(
+                k.get("network") == NETWORK and k.get("scheme") == "exact" for k in kinds
             )
+            if ok:
+                log.info("facilitator: 'exact' settlement supported on %s", NETWORK)
+            else:
+                log.error("facilitator does NOT offer 'exact' on %s — payments will fail. %s",
+                          NETWORK, str(kinds)[:300])
+            self.supported = ok
+            return ok
         except Exception as e:
-            log.error("facilitator /supported probe failed (%s). Using fallback token %s — "
-                      "payments may fail verification if this address is wrong.", e, _DEFAULT_TOKEN)
-
-        return self.token
+            log.error("facilitator /supported probe failed: %s", e)
+            return False
 
     # ── The 402 challenge ───────────────────────────────────────────────────
 
@@ -261,8 +258,13 @@ class Facilitator:
             log.error("facilitator %s: %s", path, e)
             return False, {}
 
-        if j.get("code") != "0":
-            log.error("facilitator %s rejected: %s", path, j.get("msg"))
+        # OKX returns code as an INTEGER 0, not the string "0". The docs show it quoted; the
+        # wire does not. Comparing against "0" made every successful verify and settle look
+        # like a rejection — a total, silent failure of the payment path that would only have
+        # surfaced when a real buyer tried to pay. Caught it in a /supported log dump.
+        # str() both sides: never trust a JSON number's Python type across an API boundary.
+        if str(j.get("code")) != "0":
+            log.error("facilitator %s rejected: code=%r msg=%s", path, j.get("code"), j.get("msg"))
             return False, j.get("data") or {}
         return True, j.get("data") or {}
 

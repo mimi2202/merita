@@ -293,8 +293,11 @@ async def health(_request) -> JSONResponse:
         # that three OKX docs disagree about, and every payment may silently fail verification.
         # That must be visible on the healthcheck, not buried in a log line nobody reads.
         "settlement_token": fac.token.symbol,
+        # This address is an ASSERTION, not a discovery — /supported carries no assets. It is
+        # surfaced here so it can never quietly rot: verify it on the explorer, and if OKX
+        # migrates USDT (they already have once, to USDT0), set MERITA_SETTLEMENT_ASSET.
         "settlement_asset": fac.token.address,
-        "token_discovered": fac.token_discovered,
+        "exact_scheme_supported": fac.supported,
     })
 
 
@@ -303,12 +306,11 @@ if __name__ == "__main__":
 
     port = int(os.environ.get("PORT", "8080"))
 
-    # Ask the facilitator which USDT it actually settles on X Layer, BEFORE serving a single
-    # 402. Guessing the token address is the one mistake here that fails silently and 100% of
-    # the time — buyers sign for an asset we don't accept, verification always rejects, and
-    # the service looks perfectly healthy while being completely unpayable.
+    # Confirm the facilitator will settle `exact` on X Layer before we advertise a single 402.
+    # (It will NOT tell us the token address — /supported carries networks and schemes only.
+    # The asset is the seller's assertion. See okx_x402.check_supported.)
     if fac.configured:
-        asyncio.run(fac.discover_token("USDT"))
+        asyncio.run(fac.check_supported())
     else:
         log.error("x402 unconfigured — paid tools will refuse to serve")
 
