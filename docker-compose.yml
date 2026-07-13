@@ -1,0 +1,91 @@
+# One invariant, enforced by the kernel rather than by good intentions:
+#
+#   THE PROCESS THAT RUNS STRANGERS' CODE AND THE PROCESS THAT HOLDS PRIVATE KEYS
+#   SHARE NO FILESYSTEM AND NO NETWORK ROUTE.
+#
+# My own test suite forced this. The Tier-1 sandbox blocks writes, forks, CPU and memory
+# exhaustion — but a poster's acceptance test can still call open(). That is unfixable in
+# Python (every "restricted __builtins__" recipe is escapable via ().__class__.__mro__, and
+# has been for two decades). So it is fixed below the language, with a mount table and a
+# routing table.
+#
+# A BUG I SHIPPED AND FIXED: the first draft gave the verifier `network_mode: none` AND told
+# the brain to reach it at http://verifier:9000. Those cannot both be true — a container with
+# no interfaces cannot be dialled. The right primitive is an `internal: true` network:
+# containers on it reach EACH OTHER but have no route OUT. That is exactly the property I
+# wanted. `network_mode: none` was the wrong knob, reached for in a hurry.
+
+services:
+
+  # ── Holds every private key. Runs no untrusted code, ever. ──────────────────
+  # On `keyplane` only. The verifier is not on keyplane, so untrusted code cannot reach the
+  # signer even by name, even if it guesses the hostname.
+  sidecar:
+    build: ./sidecar
+    env_file: .env
+    volumes:
+      - ./secrets:/app/secrets:ro
+    networks: [keyplane]
+    expose: ["8787"]
+    restart: unless-stopped
+
+  # ── The brain. All judgement, zero authority. ───────────────────────────────
+  # It decides money SHOULD move; it physically cannot move it. A prompt injection that fully
+  # owns this container still cannot sign a transaction — it can only ask the sidecar, over a
+  # narrow typed API that does exactly five things.
+  #
+  # The only container on BOTH networks. That is the whole topology: brain is the airlock.
+  brain:
+    build: ./brain
+    env_file: .env
+    environment:
+      SIDECAR_URL: http://sidecar:8787
+      VERIFIER_URL: http://verifier:9000
+    depends_on: [sidecar, verifier]
+    networks: [keyplane, sandbox]
+    ports: ["127.0.0.1:8000:8000"]
+    restart: unless-stopped
+
+  # ── The blast chamber. Runs the poster's acceptance test and nothing else. ──
+  #   networks: [sandbox] -> `internal: true`. Brain can dial in; this has NO route to the
+  #                          internet, so whatever it reads it cannot exfiltrate. And the
+  #                          sidecar is not on this network: the signer is unreachable, full stop.
+  #   NO volumes          -> ./secrets is not merely unreadable, it is NOT MOUNTED. The wallet
+  #                          does not exist in this container's universe. The open() my test
+  #                          suite found is now harmless: nothing in here is worth reading.
+  #   read_only + tmpfs   -> no persistence between runs.
+  #   cap_drop ALL        -> nothing to escalate to.
+  #   user 65534 (nobody) -> nothing to escalate from.
+  verifier:
+    build: ./brain
+    command: python -m merita.referee.service
+    environment:
+      VERIFIER_PORT: "9000"
+    networks: [sandbox]
+    expose: ["9000"]
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    user: "65534:65534"
+    pids_limit: 128        # deliberately ABOVE the sandbox's own RLIMIT_NPROC (64), so the
+    mem_limit: 512m        # limit that bites is the in-process one, which fails with a clean
+                           # diagnosable error instead of an opaque OOM-kill by the daemon
+    restart: unless-stopped
+
+  web:
+    build: ./web
+    ports: ["5173:5173"]
+    depends_on: [brain]
+
+networks:
+  # Signing plane. sidecar + brain.
+  keyplane:
+    driver: bridge
+
+  # Quarantine plane. brain + verifier. `internal: true` == no egress, anywhere.
+  # This one line does more security work than every RLIMIT in tier1.py combined.
+  sandbox:
+    driver: bridge
+    internal: true

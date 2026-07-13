@@ -1,0 +1,53 @@
+{
+  "version": 1,
+  "skills": {
+    "okx-agent-payments-protocol": {
+      "source": "okx/onchainos-skills",
+      "sourceType": "github",
+      "skillPath": "skills/okx-agent-payments-protocol/SKILL.md",
+      "computedHash": "0dee7a484989364d2871c53c0acdde71ac68a99261afdec683cb0e2230680e63"
+    },
+    "okx-agentic-wallet": {
+      "source": "okx/onchainos-skills",
+      "sourceType": "github",
+      "skillPath": "skills/okx-agentic-wallet/SKILL.md",
+      "computedHash": "b7daecc4ea9feebb9eb06601d44c0ebf588120940e4e6c92641f41c29a264383"
+    },
+    "okx-ai": {
+      "source": "okx/onchainos-skills",
+      "sourceType": "github",
+      "skillPath": "skills/okx-ai/SKILL.md",
+      "computedHash": "861ede61f56a2e086c2b6b05bc1769372701c32f5a550f416652f3b7de932fde"
+    },
+    "okx-dapp-discovery": {
+      "source": "okx/onchainos-skills",
+      "sourceType": "github",
+      "skillPath": "skills/okx-dapp-discovery/SKILL.md",
+      "computedHash": "2fb0cc26441599a48244c786b2c69827a1252b3db6c32d47e8eeec7a0ad3c8b9"
+    },
+    "okx-defi": {
+      "source": "okx/onchainos-skills",
+      "sourceType": "github",
+      "skillPath": "skills/okx-defi/SKILL.md",
+      "computedHash": "e744d8c5c21e9feaea25256d490f66472048f1d71129d0ffd335614e9723e0cd"
+    },
+    "okx-dex-market": {
+      "source": "okx/onchainos-skills",
+      "sourceType": "github",
+      "skillPath": "skills/okx-dex-market/SKILL.md",
+      "computedHash": "22af1059d0c0ed259b83fdf11444fd99cf6365e5274b9ad3e18f5b75cf380711"
+    },
+    "okx-growth-competition": {
+      "source": "okx/onchainos-skills",
+      "sourceType": "github",
+      "skillPath": "skills/okx-growth-competition/SKILL.md",
+      "computedHash": "2466b87abd4b66b48ceb39f278c832aba5eea16038552cf38529fd78c41d991a"
+    },
+    "okx-guide": {
+      "source": "okx/onchainos-skills",
+      "sourceType": "github",
+      "skillPath": "skills/okx-guide/SKILL.md",
+      "computedHash": "62678bfa7e89ef114b8a0005b4994d101af65452b7e19c048c64fa4bd221d6ba"
+    }
+  }
+}
