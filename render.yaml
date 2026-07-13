@@ -9,7 +9,7 @@ services:
   - type: web
     name: merita-asp
     runtime: docker
-    dockerfilePath: ./asp/Dockerfile
+    dockerfilePath: ./Dockerfile
     dockerContext: .
     plan: free
     healthCheckPath: /health
