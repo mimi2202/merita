@@ -51,25 +51,49 @@ X402_VERSION = 2
 # X Layer mainnet. CAIP-2. Not a magic number — chain ID 196.
 NETWORK = "eip155:196"
 
-# USDG on X Layer, from OKX's own facilitator docs. VERIFY THIS ON THE EXPLORER before you
-# take real money: a wrong token address means buyers sign authorizations for an asset you
-# do not accept, every payment silently fails verification, and you will spend an afternoon
-# blaming your HMAC.
-USDG_XLAYER = "0x4ae46a509f6b1d9056937ba4500cb143933d2dc8"
+# THE TOKEN ADDRESS IS DISCOVERED AT BOOT, NOT HARDCODED. Read this before you "simplify" it.
+#
+# Public sources disagree about USDT on X Layer:
+#   · OKX's bridge guide:  0x1E4a5963aBFD975d8c9021ce480b42188849D41d   ("USDT")
+#   · OKX's USDT0 FAQ:     0x779Ded0c9e1022225f8E0630b35a9b54bE713736   ("new USDT0")
+#   · and that same FAQ then says the address "remains unchanged for your convenience"
+#
+# Three OKX-authored sources, mutually inconsistent. Pick wrong and every buyer signs an
+# EIP-3009 authorization for an asset we do not accept: verification fails 100% of the time,
+# silently, on a rail that looks perfectly healthy. You would debug the HMAC for a day.
+#
+# So we do not pick. We ASK. The facilitator's /supported endpoint is the only source that
+# cannot be stale, because it IS the thing doing the settling. If two sources disagree, stop
+# choosing between them and go find the one that is authoritative by construction.
+_DEFAULT_TOKEN = "0x1E4a5963aBFD975d8c9021ce480b42188849D41d"  # fallback only; overridden at boot
+
+
+@dataclass
+class Token:
+    """A settlement asset, as the facilitator itself reports it."""
+
+    address: str
+    symbol: str
+    decimals: int = 6
+    eip712_version: str = "1"   # EIP-712 domain version of the token contract
+
+    def units(self, human: float) -> str:
+        """Human amount -> atomic string. Integers only; money is never a float."""
+        return str(int(round(human * (10 ** self.decimals))))
 
 
 @dataclass(frozen=True)
 class Price:
-    """What a tool call costs. Atomic units — integers only, never floats.
+    """What a tool call costs, in HUMAN units. The atomic conversion happens against the
+    token the facilitator told us about, at request time — never against a constant.
 
-    Money is never a float. 0.1 + 0.2 != 0.3, and a marketplace that rounds in the buyer's
-    favour bleeds, while one that rounds in its own gets reported. Integers, all the way down.
+    Money is never a float in the wire format. 0.1 + 0.2 != 0.3, and a marketplace that
+    rounds in the buyer's favour bleeds while one that rounds in its own gets reported.
+    We accept a float here only as a human-facing convenience and convert to integer atomic
+    units exactly once, at the boundary.
     """
 
-    atomic: str          # e.g. "10000" == 0.01 USDG at 6dp
-    asset: str = USDG_XLAYER
-    name: str = "USDG"
-    version: str = "2"   # EIP-712 domain version for the token contract
+    human: float          # e.g. 0.02  ->  "20000" at 6dp
 
 
 class OkxAuth:
@@ -114,22 +138,75 @@ class Facilitator:
     def __init__(self, auth: OkxAuth | None = None) -> None:
         self._auth = auth or OkxAuth()
         self._c = httpx.AsyncClient(base_url=FACILITATOR, timeout=30.0)
+        self.token = Token(address=_DEFAULT_TOKEN, symbol="USDT")
+        self.token_discovered = False
 
     @property
     def configured(self) -> bool:
         return self._auth.configured
 
+    # ── Boot-time discovery ─────────────────────────────────────────────────
+
+    async def discover_token(self, symbol: str = "USDT") -> Token:
+        """
+        Ask the facilitator which assets it will actually settle on X Layer.
+
+        This is the only source of truth that cannot be stale, because it IS the thing doing
+        the settling. Three OKX-authored docs give three different USDT addresses; rather than
+        adjudicate between them, we ask the referee. (There is a pleasing symmetry in a
+        verification service refusing to trust unverified inputs about itself.)
+
+        If the probe fails we keep the fallback and log LOUDLY. We do not crash: a facilitator
+        blip at boot should not take the service down, and a wrong-but-flagged token is
+        recoverable, whereas a dead service during OKX's 24h review window is not.
+        """
+        path = "/api/v6/pay/x402/supported"
+        try:
+            r = await self._c.get(path, headers=self._auth.headers("GET", path, ""))
+            j = r.json()
+            kinds = (j.get("data") or {}).get("kinds") or j.get("data") or []
+
+            for k in kinds if isinstance(kinds, list) else []:
+                if k.get("network") != NETWORK:
+                    continue
+                for asset in k.get("assets", []) or [k]:
+                    sym = (asset.get("symbol") or asset.get("name") or "").upper()
+                    addr = asset.get("asset") or asset.get("address")
+                    if sym == symbol.upper() and addr:
+                        self.token = Token(
+                            address=addr,
+                            symbol=sym,
+                            decimals=int(asset.get("decimals", 6)),
+                            eip712_version=str((asset.get("extra") or {}).get("version", "1")),
+                        )
+                        self.token_discovered = True
+                        log.info("facilitator: %s on X Layer = %s (%dd)",
+                                 sym, addr, self.token.decimals)
+                        return self.token
+
+            log.error(
+                "facilitator /supported did not list %s on %s. Falling back to %s — VERIFY "
+                "THIS ON THE EXPLORER before taking real payments. Raw: %s",
+                symbol, NETWORK, _DEFAULT_TOKEN, str(j)[:300],
+            )
+        except Exception as e:
+            log.error("facilitator /supported probe failed (%s). Using fallback token %s — "
+                      "payments may fail verification if this address is wrong.", e, _DEFAULT_TOKEN)
+
+        return self.token
+
     # ── The 402 challenge ───────────────────────────────────────────────────
 
     def requirements(self, *, resource_url: str, description: str, price: Price) -> dict[str, Any]:
+        t = self.token
         return {
             "scheme": "exact",
             "network": NETWORK,
-            "amount": price.atomic,
-            "asset": price.asset,
+            "amount": t.units(price.human),   # atomic, computed against the REAL decimals
+            "asset": t.address,
             "payTo": self._auth.pay_to,
             "maxTimeoutSeconds": 60,
-            "extra": {"name": price.name, "version": price.version},
+            "extra": {"name": t.symbol, "version": t.eip712_version},
             "resource": {
                 "url": resource_url,
                 "description": description,

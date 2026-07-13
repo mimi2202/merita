@@ -72,15 +72,22 @@ store = CommitStore()          # raises at boot if DATABASE_URL is unset. That i
 verifier = VerifierClient()
 graph = IntegrityGraph()
 
-# Priced in USDG atomic units (6dp). Two cents a verification.
+# USDT. Not a preference — OKX's ASP listing accepts USDT only, and the fee we register with
+# them MUST match the asset our 402 advertises. A listing that says "0.02 USDT" while the
+# challenge asks buyers to sign a USDG authorization is a service nobody can pay, that looks
+# perfectly healthy from the outside.
+#
+# The atomic amount is computed at request time against the token the FACILITATOR reports
+# (see okx_x402.discover_token) — never against a hardcoded address or decimal count. Three
+# OKX docs give three different USDT addresses on X Layer; we refuse to adjudicate and ask
+# the settlement layer itself instead.
 #
 # Priced LOW on purpose. A referee costing a meaningful fraction of the bounty is a referee
 # nobody calls on small jobs — and small, high-frequency jobs are where autonomous agent
 # labour actually lives. The thesis dies if adjudication is expensive. X Layer's sub-cent gas
-# plus OKX's gas subsidy are what make a 2-cent service viable at all; on a chain with real
-# fees this business does not exist.
-PRICE_VERIFY = Price(atomic="20000")     # 0.02 USDG
-PRICE_INTEGRITY = Price(atomic="10000")  # 0.01 USDG
+# plus OKX's gas subsidy are what make a 2-cent service viable at all.
+PRICE_VERIFY = Price(human=0.02)     # 0.02 USDT
+PRICE_INTEGRITY = Price(human=0.01)  # 0.01 USDT
 
 PAID_TOOLS = {
     "verify_deliverable": (PRICE_VERIFY, "Merita — verify a deliverable against a committed test"),
@@ -282,11 +289,28 @@ async def health(_request) -> JSONResponse:
         "network": "eip155:196",
         "x402_configured": fac.configured,
         "db": store.health(),
+        # Surfaced deliberately. If token_discovered is false we are using a FALLBACK address
+        # that three OKX docs disagree about, and every payment may silently fail verification.
+        # That must be visible on the healthcheck, not buried in a log line nobody reads.
+        "settlement_token": fac.token.symbol,
+        "settlement_asset": fac.token.address,
+        "token_discovered": fac.token_discovered,
     })
 
 
 if __name__ == "__main__":
+    import asyncio
+
     port = int(os.environ.get("PORT", "8080"))
+
+    # Ask the facilitator which USDT it actually settles on X Layer, BEFORE serving a single
+    # 402. Guessing the token address is the one mistake here that fails silently and 100% of
+    # the time — buyers sign for an asset we don't accept, verification always rejects, and
+    # the service looks perfectly healthy while being completely unpayable.
+    if fac.configured:
+        asyncio.run(fac.discover_token("USDT"))
+    else:
+        log.error("x402 unconfigured — paid tools will refuse to serve")
 
     # Build the ASGI app, then WRAP it in the paywall. Order matters: the paywall must sit
     # OUTSIDE FastMCP so it can emit a real HTTP 402 before FastMCP ever parses the request.
