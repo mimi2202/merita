@@ -1,9 +1,10 @@
-# Render free tier. One container, HTTPS, a real domain, no card.
+# Render free tier. No disk (free instances can't have one) — durability comes from an
+# external Postgres instead. See asp/store.py for why that is not negotiable.
 #
 # COLD STARTS WILL KILL YOUR SUBMISSION IF YOU IGNORE THEM.
-# Free instances spin down after ~15 min idle; the next request eats a ~50s cold start.
-# If OKX's reviewer hits a sleeping endpoint, the listing fails review — and a failed
-# listing means the hackathon submission is INVALID, not merely weaker.
+# Free instances spin down after ~15 min idle; the next request eats a ~50s cold start. If
+# OKX's reviewer hits a sleeping endpoint the listing fails review — and a failed listing
+# makes the hackathon submission INVALID, not merely weaker.
 # Set up a free cron (cron-job.org) hitting /health every 10 minutes THE DAY YOU DEPLOY.
 services:
   - type: web
@@ -14,17 +15,15 @@ services:
     plan: free
     healthCheckPath: /health
     envVars:
+      - key: DATABASE_URL
+        sync: false            # Neon connection string (free, permanent, no card)
       - key: OKX_API_KEY
-        sync: false            # set in the Render dashboard, never in git
+        sync: false            # set in the dashboard, never in git
       - key: OKX_API_SECRET
         sync: false
       - key: OKX_API_PASSPHRASE
         sync: false
       - key: MERITA_PAYTO_ADDRESS
-        sync: false            # your X Layer address — where the USDG lands
+        sync: false            # your Agentic Wallet — where the USDG lands
       - key: MERITA_PUBLIC_URL
         value: https://merita-asp.onrender.com/mcp
-    disk:
-      name: merita-data
-      mountPath: /data
-      sizeGB: 1
