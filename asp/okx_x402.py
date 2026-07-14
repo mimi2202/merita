@@ -294,10 +294,56 @@ class Facilitator:
         return base64.b64encode(json.dumps(settle_data).encode()).decode()
 
     async def _call(self, path: str, payload: dict, reqs: dict) -> tuple[bool, dict]:
+        """
+        Forward the buyer's payment payload to the facilitator.
+
+        THE ENVELOPE PROBLEM — this cost a real payment to find.
+        ────────────────────────────────────────────────────────
+        The docs say "the Seller forwards it verbatim to the Facilitator", so that is what I
+        did. The facilitator answered:
+
+            {"invalidReason": "param_mismatch",
+             "invalidMessage": "paymentPayload.accepted is null"}
+
+        Because "verbatim" assumes the buyer sends a COMPLETE payload. OKX's own /verify
+        example shows paymentPayload containing FOUR keys:
+
+            {x402Version, resource, accepted, payload:{signature, authorization}}
+
+        But `onchainos payment pay` returns only the inner proof — {authorization, signature}.
+        The buyer signs; it does not re-state the terms. Which is correct, and obvious in
+        hindsight: the terms are the SELLER's assertion. We wrote them. We are the only party
+        who can authoritatively say what was advertised, and re-deriving them from the buyer's
+        header would mean trusting the buyer to tell us what we charged.
+
+        So we assemble the envelope: the buyer's signature over OUR requirements. If the buyer
+        signed different terms than the ones we put in `accepted`, the signature simply will
+        not verify — the cryptography, not our bookkeeping, is what enforces agreement. That
+        is the right place for the check to live.
+
+        We pass through anything the buyer DID send (some clients send the full envelope), and
+        fill in only what is missing. Liberal in what you accept.
+        """
+        inner = payload.get("payload") or {
+            k: v for k, v in payload.items()
+            if k in ("signature", "authorization")
+        }
+
+        envelope = {
+            "x402Version": X402_VERSION,
+            "resource": payload.get("resource") or reqs.get("resource"),
+            # The terms WE advertised in the 402. Not the buyer's word for them.
+            "accepted": payload.get("accepted") or {
+                k: v for k, v in reqs.items() if k != "resource"
+            },
+            "payload": inner,
+        }
+
         body = json.dumps(
-            {"x402Version": X402_VERSION, "paymentPayload": payload, "paymentRequirements": reqs},
+            {"x402Version": X402_VERSION, "paymentPayload": envelope, "paymentRequirements": reqs},
             separators=(",", ":"),
         )
+
         try:
             r = await self._c.post(path, content=body, headers=self._auth.headers("POST", path, body))
             j = r.json()
@@ -305,15 +351,25 @@ class Facilitator:
             log.error("facilitator %s: %s", path, e)
             return False, {}
 
-        # OKX returns code as an INTEGER 0, not the string "0". The docs show it quoted; the
-        # wire does not. Comparing against "0" made every successful verify and settle look
-        # like a rejection — a total, silent failure of the payment path that would only have
-        # surfaced when a real buyer tried to pay. Caught it in a /supported log dump.
-        # str() both sides: never trust a JSON number's Python type across an API boundary.
         if str(j.get("code")) != "0":
             log.error("facilitator %s rejected: code=%r msg=%s", path, j.get("code"), j.get("msg"))
             return False, j.get("data") or {}
-        return True, j.get("data") or {}
+
+        data = j.get("data") or {}
+
+        # Log the FULL rejection. A payment that fails for an unlogged reason is a payment you
+        # will debug twice.
+        if data.get("isValid") is False or data.get("success") is False:
+            log.error(
+                "x402 %s REJECTED — reason=%r msg=%r | sent accepted=%s | full=%s",
+                path.rsplit("/", 1)[-1],
+                data.get("invalidReason") or data.get("errorReason"),
+                data.get("invalidMessage") or data.get("errorMessage"),
+                json.dumps(envelope["accepted"]),
+                data,
+            )
+
+        return True, data
 
     async def close(self) -> None:
         if self._client is not None:
