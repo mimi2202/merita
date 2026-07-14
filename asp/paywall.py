@@ -71,7 +71,7 @@ class X402Paywall:
             # tools/list, initialize, ping, and every free tool sail straight through.
             # This is what keeps MCP discovery working — and discovery has to work, or OKX
             # cannot review the listing and the submission is invalid.
-            return await self.app(scope, _replay(body), send)
+            return await self.app(scope, _replay(body, receive), send)
 
         price, description = self.paid[tool]
 
@@ -96,7 +96,7 @@ class X402Paywall:
         # succeeds, in the tool itself, via the context we stash here. verify() is free and
         # reversible; settle() moves money and is not. Never merge them.
         scope["merita_payment"] = {"reqs": reqs, "x_payment": x_payment}
-        await self.app(scope, _replay(body), send)
+        await self.app(scope, _replay(body, receive), send)
 
 
 # ── ASGI plumbing ────────────────────────────────────────────────────────────
@@ -114,16 +114,47 @@ async def _drain(receive: Receive) -> bytes:
     return b"".join(chunks)
 
 
-def _replay(body: bytes) -> Receive:
-    """Hand the buffered body downstream as if it were never read."""
+def _replay(body: bytes, original: Receive) -> Receive:
+    """
+    Hand the buffered body downstream as if it were never read — then GET OUT OF THE WAY.
+
+    THE BUG THIS FIXES COST US HALF A DAY, AND IT IS SUBTLE ENOUGH TO DESERVE THE ESSAY.
+    ────────────────────────────────────────────────────────────────────────────────────
+    The first version returned {"type": "http.disconnect"} on every call after the body:
+
+        async def receive():
+            if sent: return {"type": "http.disconnect"}    # <- a lie
+            ...
+
+    That looks harmless. The body has been delivered; what else could the app want?
+
+    It wants to know if the CLIENT IS STILL THERE. In ASGI, an app streaming a long-lived
+    response polls receive() to detect a hang-up. FastMCP's SSE transport does exactly this
+    while it streams. My middleware answered that poll with "the client disconnected" — so
+    FastMCP dutifully tore down the stream BEFORE writing the response event.
+
+    The symptom was maddening and pointed everywhere except here: the HTTP 200 went out, the
+    mcp-session-id header went out, the SSE stream opened... and then nothing. curl looked
+    fine, because we were only ever inspecting headers with -i and -D. Any client that
+    actually WAITS for the body — i.e. every real MCP client — hung and reported "failed to
+    connect." We blamed DNS, then a VPN, then Render's cold starts, then Claude Code itself.
+
+    Two lessons, and I'd rather write them down than pretend I knew:
+      1. A middleware that swallows a request stream must forward the REST of that stream,
+         not fabricate its end. `receive` is a channel, not a one-shot.
+      2. `curl -i` proving "the server responds" proves the server responds WITH HEADERS.
+         It is not a test of the body. Test what the client actually consumes.
+    """
     sent = False
 
     async def receive() -> Message:
         nonlocal sent
-        if sent:
-            return {"type": "http.disconnect"}
-        sent = True
-        return {"type": "http.request", "body": body, "more_body": False}
+        if not sent:
+            sent = True
+            return {"type": "http.request", "body": body, "more_body": False}
+        # Body's been replayed. Everything after this — including a REAL http.disconnect when
+        # the client genuinely leaves — is the transport's business, not ours. Delegate.
+        return await original()
 
     return receive
 
