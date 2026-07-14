@@ -276,12 +276,51 @@ async def assess_integrity(
 # HTTP
 # ─────────────────────────────────────────────────────────────────────────────
 
+SANDBOX_OK: bool | None = None
+
+
 async def _startup() -> None:
     """Runs on uvicorn's loop, not a throwaway one."""
+    global SANDBOX_OK
+
     if fac.configured:
         await fac.check_supported()
     else:
         log.error("x402 unconfigured — paid tools will refuse to serve")
+
+    # SELF-TEST THE SANDBOX AT BOOT.
+    #
+    # A real payment settled on-chain before we discovered the sandbox was unreachable. The
+    # fail-open rule saved us — "escalate, do not slash" rather than falsely failing an honest
+    # worker — but the buyer still paid for a verdict we could not render. Once is a bug.
+    # Twice would be a pattern, and on a marketplace with on-chain reputation, a pattern is
+    # permanent.
+    #
+    # So: run a known-good check through the real sandbox at boot, and surface the result on
+    # /health. If the sandbox is broken, we want to know while the service is starting — not
+    # after someone's money has moved.
+    from merita.models import AcceptanceTest  # noqa: PLC0415
+
+    probe = AcceptanceTest(source="def check(o): return o.get('ok') is True")
+    try:
+        v = await verifier.verify(
+            revealed_source=probe.source,
+            revealed_nonce=probe.nonce,
+            commitment=probe.commitment(),
+            deliverable={"ok": True},
+        )
+        SANDBOX_OK = bool(v.passed and v.confidence == 1.0)
+    except Exception as e:
+        log.error("sandbox self-test threw: %s", e)
+        SANDBOX_OK = False
+
+    if SANDBOX_OK:
+        log.info("sandbox: self-test PASSED")
+    else:
+        log.error(
+            "SANDBOX SELF-TEST FAILED. verify_deliverable will take payment and return a "
+            "non-verdict. DO NOT serve traffic in this state."
+        )
 
 
 @mcp.custom_route("/health", methods=["GET"])
@@ -306,6 +345,9 @@ async def health(_request) -> JSONResponse:
         # migrates USDT (they already have once, to USDT0), set MERITA_SETTLEMENT_ASSET.
         "settlement_asset": fac.token.address,
         "exact_scheme_supported": fac.supported,
+        # If this is not true, the referee cannot referee. Everything else being green is
+        # worse than useless — it means we will charge for verdicts we cannot render.
+        "sandbox": SANDBOX_OK,
     })
 
 
