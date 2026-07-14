@@ -276,6 +276,14 @@ async def assess_integrity(
 # HTTP
 # ─────────────────────────────────────────────────────────────────────────────
 
+async def _startup() -> None:
+    """Runs on uvicorn's loop, not a throwaway one."""
+    if fac.configured:
+        await fac.check_supported()
+    else:
+        log.error("x402 unconfigured — paid tools will refuse to serve")
+
+
 @mcp.custom_route("/health", methods=["GET"])
 async def health(_request) -> JSONResponse:
     """Render's health check AND the cron ping that stops the free tier sleeping.
@@ -302,23 +310,38 @@ async def health(_request) -> JSONResponse:
 
 
 if __name__ == "__main__":
-    import asyncio
-
     port = int(os.environ.get("PORT", "8080"))
 
-    # Confirm the facilitator will settle `exact` on X Layer before we advertise a single 402.
-    # (It will NOT tell us the token address — /supported carries networks and schemes only.
-    # The asset is the seller's assertion. See okx_x402.check_supported.)
-    if fac.configured:
-        asyncio.run(fac.check_supported())
-    else:
-        log.error("x402 unconfigured — paid tools will refuse to serve")
+    # NOTE: the /supported probe used to run here via asyncio.run(). That was the bug.
+    # asyncio.run() CLOSES its event loop on exit, and httpx clients are bound to the loop
+    # they were created in — so the facilitator client came up dead and every settlement
+    # failed with "Event loop is closed" while the service looked perfectly healthy.
+    #
+    # The probe now runs inside the app's own lifespan (see _startup below), on the same loop
+    # uvicorn will serve from. Rule of thumb, learned the expensive way: never asyncio.run()
+    # anything in a process that is about to hand a loop to a server.
 
     # Build the ASGI app, then WRAP it in the paywall. Order matters: the paywall must sit
     # OUTSIDE FastMCP so it can emit a real HTTP 402 before FastMCP ever parses the request.
     # Inside, the best it could do is a JSON-RPC error in a 200 — which no x402 client on
     # earth will recognise as a request for payment.
     app = mcp.http_app()
+
+    # Probe the facilitator on the SERVER's loop, once it is up. Wrapping the existing
+    # lifespan rather than replacing it: FastMCP initialises its session manager in there,
+    # and dropping that would break every MCP call.
+    _inner_lifespan = app.router.lifespan_context
+
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def _lifespan(app_):
+        async with _inner_lifespan(app_):
+            await _startup()
+            yield
+            await fac.close()
+
+    app.router.lifespan_context = _lifespan
     app = X402Paywall(app, facilitator=fac, paid_tools=PAID_TOOLS, resource_url=PUBLIC_URL)
 
     import uvicorn

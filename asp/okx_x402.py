@@ -137,7 +137,19 @@ class OkxAuth:
 class Facilitator:
     def __init__(self, auth: OkxAuth | None = None) -> None:
         self._auth = auth or OkxAuth()
-        self._c = httpx.AsyncClient(base_url=FACILITATOR, timeout=30.0)
+        # LAZY. Do NOT construct the AsyncClient here.
+        #
+        # httpx binds its connection pool to the event loop that is running when it is
+        # created. Constructing it at import time binds it to whatever loop happens to exist
+        # then — and `asyncio.run(check_supported())` at startup CLOSES its loop when it
+        # returns. The client is then holding a corpse. Uvicorn starts a fresh loop, the first
+        # real payment arrives, and the facilitator call dies with "Event loop is closed".
+        #
+        # The failure is beautifully cruel: /health is green, the 402 fires correctly, the
+        # buyer signs correctly, the replay is correct — and settlement fails anyway, with an
+        # error that points at asyncio rather than at the line that caused it. Cost: one real
+        # payment attempt to find, one line to fix.
+        self._client: httpx.AsyncClient | None = None
         # An OPERATOR ASSERTION, not a discovery. See check_supported() for why there is no
         # honest way to discover this. Overridable by env so a wrong guess is a config change,
         # not a redeploy of code.
@@ -145,12 +157,33 @@ class Facilitator:
             address=os.environ.get("MERITA_SETTLEMENT_ASSET", _DEFAULT_TOKEN),
             symbol=os.environ.get("MERITA_SETTLEMENT_SYMBOL", "USDT"),
             decimals=int(os.environ.get("MERITA_SETTLEMENT_DECIMALS", "6")),
+            # EIP-712 DOMAIN VERSION OF THE TOKEN CONTRACT. Overridable, because getting it
+            # wrong is invisible and total.
+            #
+            # The buyer signs an EIP-3009 authorization over a domain separator built from
+            # (name, version, chainId, verifyingContract). If our advertised `version` differs
+            # from what the token contract actually declares, the buyer signs over a DIFFERENT
+            # domain than the facilitator reconstructs — and the signature fails to recover to
+            # the payer's address. Every time. With no diagnostic beyond "invalid signature".
+            #
+            # OKX's own doc examples show version "2" for their stablecoin; the ERC-20 default
+            # is "1". I cannot verify USD₮0's from here, so it is an env var: if verify fails
+            # with a signature error, flip MERITA_TOKEN_VERSION to 2 and restart. Thirty
+            # seconds, no redeploy.
+            eip712_version=os.environ.get("MERITA_TOKEN_VERSION", "1"),
         )
         self.supported = False
 
     @property
     def configured(self) -> bool:
         return self._auth.configured
+
+    @property
+    def _c(self) -> httpx.AsyncClient:
+        """Created on first use, inside the loop that will actually use it."""
+        if self._client is None:
+            self._client = httpx.AsyncClient(base_url=FACILITATOR, timeout=30.0)
+        return self._client
 
     # ── Boot-time discovery ─────────────────────────────────────────────────
 
@@ -230,7 +263,21 @@ class Facilitator:
             return False, "facilitator unreachable"
         if data.get("isValid") is True or data.get("success") is True:
             return True, None
-        return False, data.get("invalidReason") or data.get("errorReason") or "verification failed"
+
+        # Log the FULL facilitator response, not just the reason code. The paywall
+        # deliberately tells the buyer nothing (never leak validation internals to an
+        # unauthenticated caller) — which means this log line is the ONLY place the truth
+        # exists. If it is terse, the operator is blind, and a silent total payment failure
+        # is indistinguishable from a working service. Verbosity here is not sloppiness; it
+        # is the compensating control for the silence out there.
+        reason = data.get("invalidReason") or data.get("errorReason") or "unknown"
+        log.error(
+            "x402 VERIFY REJECTED — reason=%r msg=%r | advertised asset=%s version=%s payTo=%s | "
+            "full facilitator response: %s",
+            reason, data.get("errorMessage"), self.token.address, self.token.eip712_version,
+            self._auth.pay_to, str(data)[:500],
+        )
+        return False, reason
 
     async def settle(self, x_payment_b64: str, reqs: dict[str, Any]) -> dict[str, Any] | None:
         """Irreversible. Call this ONLY after the work succeeded."""
@@ -269,4 +316,6 @@ class Facilitator:
         return True, j.get("data") or {}
 
     async def close(self) -> None:
-        await self._c.aclose()
+        if self._client is not None:
+            await self._client.aclose()
+            self._client = None
