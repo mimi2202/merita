@@ -235,7 +235,26 @@ class Facilitator:
             "amount": t.units(price.human),   # atomic, computed against the REAL decimals
             "asset": t.address,
             "payTo": self._auth.pay_to,
-            "maxTimeoutSeconds": 60,
+            # 10 MINUTES, not 60 seconds. Read this before you "tighten" it.
+            #
+            # maxTimeoutSeconds is the validity window of the buyer's EIP-3009 authorization.
+            # I set 60s by copying the docs' example, which is a sane default for a machine
+            # calling a machine over a warm connection.
+            #
+            # It is nowhere near enough for a real agent flow. Between signing and arrival:
+            # the MCP initialize handshake, notifications/initialized, the agent assembling
+            # the paid replay, a HUMAN approving the charge on a confirmation card, and a free
+            # -tier host that may be cold-starting for 50 seconds. Two valid, correctly-signed
+            # authorizations died in that gap — the facilitator said `expired`, and the buyer's
+            # agent concluded the header format was wrong and started guessing wire formats.
+            #
+            # A too-short window does not fail loudly. It fails as a phantom protocol bug, and
+            # sends whoever is debugging it down a completely wrong path. That is the whole
+            # cost of this one number.
+            #
+            # 600s is still far shorter than any settlement risk window that matters, and the
+            # nonce makes each authorization single-use regardless.
+            "maxTimeoutSeconds": 600,
             "extra": {"name": t.symbol, "version": t.eip712_version},
             "resource": {
                 "url": resource_url,
