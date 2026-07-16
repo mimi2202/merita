@@ -54,11 +54,24 @@ PaidTools = dict[str, tuple[Any, str]]
 
 
 class X402Paywall:
-    def __init__(self, app: ASGIApp, *, facilitator, paid_tools: PaidTools, resource_url: str) -> None:
+    def __init__(self, app: ASGIApp, *, facilitator, paid_tools: PaidTools, resource_url: str,
+                 precheck=None) -> None:
         self.app = app
         self.fac = facilitator
         self.paid = paid_tools
         self.resource_url = resource_url
+        # Optional (tool_name, arguments) -> (ok: bool, reason: str). Runs BEFORE payment.
+        #
+        # WHY THIS EXISTS: charging for a call that CANNOT succeed is theft, however small.
+        # verify_deliverable for a task_id that was never committed is a guaranteed "no test"
+        # rejection — and the old flow charged 0.02 USDT for it anyway. A referee that bills
+        # you to tell you it can't judge is not a referee anyone calls twice.
+        #
+        # So the paywall asks this hook "will this call actually produce a result?" before it
+        # asks for money. If not, it returns the reason for FREE — no 402, no charge. The hook
+        # is injected rather than hard-coded so the paywall stays business-logic-agnostic:
+        # it knows how to take payment, not what Merita sells.
+        self._precheck = precheck
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
@@ -113,6 +126,36 @@ class X402Paywall:
         if not self.fac.configured:
             log.error("paid tool %s called but x402 is unconfigured — refusing", tool)
             return await _json(send, 503, {"error": "payment not configured"})
+
+        # ── PRE-PAYMENT GATE: never charge for a call that cannot produce a result. ──
+        # Runs before the 402. If verify_deliverable names a task with no committed test, the
+        # answer is a free, honest rejection — not a paid non-verdict. This is the
+        # double-charge-on-rejection fix.
+        if self._precheck is not None:
+            args = _tool_args(body)
+            try:
+                ok, reason = self._precheck(tool, args)
+            except Exception as e:
+                # A broken precheck must NOT block a legitimate paid call. Fail open: if we
+                # can't determine that the call is doomed, let it proceed to payment.
+                log.error("precheck raised (%s) — allowing call through to payment", e)
+                ok, reason = True, ""
+            if not ok:
+                log.info("free-rejecting %s before payment: %s", tool, reason)
+                return await _json(send, 200, {
+                    "jsonrpc": "2.0",
+                    "id": _rpc_id(body),
+                    "result": {
+                        "content": [{
+                            "type": "text",
+                            "text": json.dumps({
+                                "error": reason,
+                                "charged": False,
+                                "hint": "no payment was taken — resolve the above and retry",
+                            }),
+                        }],
+                    },
+                })
 
         reqs = self.fac.requirements(
             resource_url=self.resource_url, description=description, price=price
@@ -266,6 +309,21 @@ def _tool_name(body: bytes) -> str | None:
     if not isinstance(rpc, dict) or rpc.get("method") != "tools/call":
         return None
     return (rpc.get("params") or {}).get("name")
+
+
+def _tool_args(body: bytes) -> dict:
+    try:
+        rpc = json.loads(body)
+        return (rpc.get("params") or {}).get("arguments") or {}
+    except Exception:
+        return {}
+
+
+def _rpc_id(body: bytes):
+    try:
+        return json.loads(body).get("id")
+    except Exception:
+        return None
 
 
 def _header(scope: Scope, name: bytes) -> str | None:

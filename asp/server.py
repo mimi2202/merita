@@ -388,7 +388,27 @@ if __name__ == "__main__":
             await fac.close()
 
     app.router.lifespan_context = _lifespan
-    app = X402Paywall(app, facilitator=fac, paid_tools=PAID_TOOLS, resource_url=PUBLIC_URL)
+    def _precheck(tool: str, args: dict) -> tuple[bool, str]:
+        """Refuse to charge for a call that cannot produce a result.
+
+        For verify_deliverable: if there is no committed test for this task_id, the verdict is
+        a guaranteed 'no test' rejection. Charging 0.02 USDT for that is charging for nothing.
+        Return the rejection for free instead. assess_integrity has no such precondition, so it
+        passes straight through to payment.
+        """
+        if tool == "verify_deliverable":
+            task_id = (args or {}).get("task_id")
+            if not task_id:
+                return False, "task_id is required"
+            if store.get(task_id) is None:
+                return False, (
+                    f"no committed acceptance test for task '{task_id}'. Call "
+                    f"commit_acceptance_test first (it's free). No payment was taken."
+                )
+        return True, ""
+
+    app = X402Paywall(app, facilitator=fac, paid_tools=PAID_TOOLS, resource_url=PUBLIC_URL,
+                      precheck=_precheck)
 
     import uvicorn
     log.info("merita up on :%d | x402=%s | tools=%s", port, fac.configured, list(PAID_TOOLS))
