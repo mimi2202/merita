@@ -91,9 +91,12 @@ class X402Paywall:
 
         body = await _drain(receive)
 
-        # A POST that is NOT valid MCP JSON-RPC, arriving at /mcp, is also a probe — answer it
-        # with a 402 rather than letting FastMCP 406 it on the Accept header.
-        if _tool_name(body) is None and not _is_mcp_rpc(body):
+        # A POST that is NOT valid MCP JSON-RPC, arriving AT THE MCP PATH, is also a probe —
+        # answer it with a 402 rather than letting FastMCP 406 it on the Accept header. Scoped
+        # to /mcp so a malformed POST to any other route is left entirely alone.
+        _p = scope.get("path", "").rstrip("/")
+        _is_mcp = _p.endswith("/mcp") or _p == "/mcp"
+        if _is_mcp and _tool_name(body) is None and not _is_mcp_rpc(body):
             price, desc = self.paid.get("verify_deliverable", (next(iter(self.paid.values()))))
             reqs = self.fac.requirements(resource_url=self.resource_url, description=desc, price=price)
             return await _402(send, self.fac.challenge_header(reqs), reqs)
@@ -133,11 +136,24 @@ class X402Paywall:
 
     def _looks_like_x402_probe(self, scope: Scope) -> bool:
         """
-        A GET to our endpoint is never a valid MCP call — MCP streamable-HTTP is POST-only
-        for requests. x402 discovery tools GET the resource to read the 402 challenge. So a
-        GET here is a probe, and we answer it with the challenge instead of letting FastMCP
-        406 it. We also treat an explicit x402 signal header as a probe regardless of method.
+        A GET to the MCP RESOURCE PATH is an x402 discovery probe. A GET to anything else —
+        /health above all — is not, and must pass through untouched.
+
+        THE BUG THIS GUARD FIXES, WHICH I CAUSED AND CAUGHT IN ONE DEPLOY:
+        the first version treated EVERY GET as a probe. Render health-checks /health with a
+        GET. So /health started returning 402, Render concluded the service was unhealthy, and
+        the deploy hung forever — the new code could never go live because the platform's
+        liveness gate was answering "payment required" to the platform itself. A paywall that
+        bills the landlord does not get to stay in the building.
+
+        So: probes are scoped to the MCP path only. Everything else is none of the paywall's
+        business.
         """
+        path = scope.get("path", "")
+        is_mcp_path = path.rstrip("/").endswith("/mcp") or path.rstrip("/") == "/mcp"
+        if not is_mcp_path:
+            return False
+
         if scope["method"] == "GET":
             return True
         for k, v in scope.get("headers", []):
