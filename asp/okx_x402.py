@@ -96,6 +96,33 @@ class Price:
     human: float          # e.g. 0.02  ->  "20000" at 6dp
 
 
+@dataclass(frozen=True)
+class Settlement:
+    """Result of honoring a payment. ok=True means the buyer has paid for these terms —
+    whether it settled just now or was already settled when they replayed."""
+
+    ok: bool
+    reason: str
+    receipt: dict | None
+
+
+# Facilitators (and chains) describe an already-consumed authorization a dozen different ways.
+# We honor a payment if ANY of these appear — because "you already paid" must never be
+# mistaken for "you didn't pay". Being liberal here can only ever help a buyer who genuinely
+# paid; it cannot let a non-payer through, because a non-payer's settle() simply fails with a
+# signature or balance error that matches none of these.
+_ALREADY_SETTLED_MARKERS = (
+    "already settled", "already used", "nonce already", "authorization used",
+    "duplicate", "already redeemed", "already processed", "settled",
+    "authorizationused", "nonceused",
+)
+
+
+def _looks_already_settled(text: str) -> bool:
+    t = (text or "").lower()
+    return any(m in t for m in _ALREADY_SETTLED_MARKERS)
+
+
 class OkxAuth:
     """OKX v5 HMAC. Same scheme as their exchange API."""
 
@@ -267,6 +294,45 @@ class Facilitator:
         """PAYMENT-REQUIRED: base64(JSON). The buyer's agent decodes this and signs."""
         body = {"x402Version": X402_VERSION, "accepts": [reqs]}
         return base64.b64encode(json.dumps(body).encode()).decode()
+
+    # ── honor payment (the permanent fix) ────────────────────────────────────
+
+    async def settle_or_accept(self, x_payment_b64: str, reqs: dict[str, Any]) -> "Settlement":
+        """
+        Honor a payment. ok=True if the buyer HAS PAID for these terms — whether it settles
+        now, or already settled before they replayed.
+
+        This fixes the "paid three times, zero verdicts" bug. The old path gated on verify(),
+        which checks an UNSPENT EIP-3009 authorization and therefore FAILS for a payment that
+        already settled on-chain (its nonce is burned). OKX's buyer tooling settles first and
+        replays second, so verify() always failed and we re-issued a 402 to someone who had
+        already paid. Gate on settlement instead:
+
+          settle succeeds now          -> ok
+          already settled / nonce used -> ok   (buyer settled first; honor it)
+          insufficient funds / bad sig -> NOT ok
+        """
+        try:
+            payload = json.loads(base64.b64decode(x_payment_b64))
+        except Exception:
+            return Settlement(ok=False, reason="malformed X-PAYMENT header", receipt=None)
+
+        ok, data = await self._call("/api/v6/pay/x402/settle", payload, reqs)
+
+        if not ok:
+            reason = str(data.get("invalidReason") or data.get("errorReason") or data)
+            if _looks_already_settled(reason) or _looks_already_settled(json.dumps(data)):
+                log.info("payment already settled on-chain — honoring it")
+                return Settlement(ok=True, reason="already settled", receipt=data)
+            return Settlement(ok=False, reason=reason, receipt=None)
+
+        if data.get("success") is True or data.get("settled") is True or data.get("transaction"):
+            return Settlement(ok=True, reason="settled", receipt=data)
+
+        if _looks_already_settled(json.dumps(data)):
+            return Settlement(ok=True, reason="already settled", receipt=data)
+
+        return Settlement(ok=False, reason=f"settle inconclusive: {data}", receipt=None)
 
     # ── verify → (work) → settle ────────────────────────────────────────────
 

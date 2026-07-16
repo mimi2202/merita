@@ -122,15 +122,40 @@ class X402Paywall:
         if not x_payment:
             return await _402(send, self.fac.challenge_header(reqs), reqs)
 
-        ok, reason = await self.fac.verify(x_payment, reqs)
-        if not ok:
-            log.warning("x402 verify failed for %s: %s", tool, reason)
+        # ── HONOR THE PAYMENT — the permanent fix ────────────────────────────
+        #
+        # THE BUG (reported by an OKX admin, after paying THREE times for ZERO verdicts):
+        # the old flow was verify() -> run tool -> settle(). It assumed WE control settlement
+        # timing. We do not. OKX's buyer tooling SETTLES the payment on-chain first (tx
+        # 0x657e3c...), THEN replays with X-PAYMENT. By then the EIP-3009 authorization is
+        # spent — its nonce is burned on-chain — so our verify() call returned "invalid", we
+        # re-issued a 402, and the buyer was told to pay for something they had already paid
+        # for. Forever. Every settled payment looked to us like a fresh non-payment.
+        #
+        # The root confusion: verify() checks an UNSPENT authorization; it necessarily FAILS
+        # for an already-settled one. Using verify() as the gate makes "already paid" and
+        # "never paid" indistinguishable — and resolves both to "pay again".
+        #
+        # THE FIX: gate on SETTLEMENT, not on an unspent authorization. Call settle(), and
+        # treat "already settled" as SUCCESS. This is correct for BOTH buyer behaviours:
+        #   · buyer settled first (admin's tooling): settle() reports already-done -> proceed
+        #   · buyer expects us to settle:            settle() does it now          -> proceed
+        # Either way, a real on-chain payment for our terms results in the work being done and
+        # the verdict returned in the 200 body. There is no path left where a paid buyer is
+        # re-challenged.
+        settled = await self.fac.settle_or_accept(x_payment, reqs)
+        if not settled.ok:
+            log.warning("x402 payment not honored for %s: %s", tool, settled.reason)
             return await _402(send, self.fac.challenge_header(reqs), reqs)
 
-        # PAID AND VERIFIED — but NOT yet settled. Settlement happens after the work
-        # succeeds, in the tool itself, via the context we stash here. verify() is free and
-        # reversible; settle() moves money and is not. Never merge them.
-        scope["merita_payment"] = {"reqs": reqs, "x_payment": x_payment}
+        # Paid and settled. Stash the receipt so the tool can return it in the 200 body.
+        # NOTHING further to settle — settlement is now behind us, by design.
+        scope["merita_payment"] = {
+            "reqs": reqs,
+            "x_payment": x_payment,
+            "receipt": settled.receipt,
+            "already_settled": True,
+        }
         await self.app(scope, _replay(body, receive), send)
 
 

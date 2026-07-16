@@ -110,12 +110,14 @@ mcp = FastMCP(
 
 async def _settle() -> str | None:
     """
-    Settle the payment the middleware already verified. Called AFTER the work succeeded.
+    Return the payment receipt the paywall ALREADY captured. Does NOT settle again.
 
-    If settlement fails we STILL return the result. The buyer signed in good faith; the
-    failure is between us and the facilitator. Withholding a verdict to punish a failed
-    settlement, on a marketplace where reputation is literally on-chain, is a catastrophic
-    trade for a few cents.
+    This changed with the "paid three times, zero verdicts" fix. Settlement now happens ONCE,
+    in the paywall, before the tool runs (see paywall.py settle_or_accept). By the time we are
+    here, the money has moved and the receipt is sitting on the request scope. The old code
+    called settle() a SECOND time here — which failed, because the authorization's nonce was
+    already spent by the first settlement, and returned None, throwing away a receipt for a
+    payment that had genuinely succeeded. One payment, settled once, receipt read once.
     """
     try:
         req = get_http_request()
@@ -126,11 +128,13 @@ async def _settle() -> str | None:
     if not pay:
         return None
 
-    data = await fac.settle(pay["x_payment"], pay["reqs"])
-    if not data:
-        log.error("SETTLEMENT FAILED after work completed — serving result anyway")
+    receipt = pay.get("receipt")
+    if not receipt:
         return None
-    return fac.receipt_header(data)
+    try:
+        return fac.receipt_header(receipt)
+    except Exception:
+        return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
