@@ -77,6 +77,14 @@ class X402Paywall:
         if scope["type"] != "http":
             return await self.app(scope, receive, send)
 
+        # The plain-HTTP x402 door (/x402/*) handles its OWN payment lifecycle end-to-end
+        # (see http_x402.py). The MCP paywall must not touch it, or it would double-gate the
+        # request — issue a 402 for a call that already carries its own settled payment. Two
+        # doors, two independent payment paths, one brain.
+        path = scope.get("path", "")
+        if path.startswith("/x402/"):
+            return await self.app(scope, receive, send)
+
         # ── x402 DISCOVERY PROBE — must be answered BEFORE FastMCP sees the request ──
         #
         # THE BUG (reported by an OKX admin): the buyer's x402 tooling probes /mcp to ask

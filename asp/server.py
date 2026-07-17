@@ -57,6 +57,7 @@ from starlette.responses import JSONResponse
 
 from merita.integrity.graph import IntegrityGraph
 
+from .http_x402 import make_x402_routes
 from .okx_x402 import Facilitator, Price
 from .paywall import X402Paywall
 from .store import CommitStore
@@ -325,6 +326,22 @@ async def _startup() -> None:
             "SANDBOX SELF-TEST FAILED. verify_deliverable will take payment and return a "
             "non-verdict. DO NOT serve traffic in this state."
         )
+
+
+@mcp.custom_route("/x402/verify", methods=["POST"])
+async def x402_verify(request):
+    """Plain-HTTP x402 door for the OKX buyer CLI (task-402-pay).
+
+    The MCP door (/mcp) requires a session + text/event-stream, which the plain-HTTP buyer
+    does not speak. This route takes a plain JSON POST, honors the settled payment, and
+    returns the verdict IN THE BODY — synchronous settlement, per OKX's own x402 docs. Same
+    store, sandbox, and facilitator as /mcp; only the entrance differs.
+    """
+    handler = make_x402_routes(
+        fac=fac, store=store, verifier=verifier,
+        price=PRICE_VERIFY, resource_url=PUBLIC_URL.replace("/mcp", "/x402/verify"),
+    )
+    return await handler(request)
 
 
 @mcp.custom_route("/health", methods=["GET"])
