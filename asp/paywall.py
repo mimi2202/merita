@@ -230,8 +230,20 @@ class X402Paywall:
         # re-challenged.
         settled = await self.fac.settle_or_accept(x_payment, reqs)
         if not settled.ok:
-            log.warning("x402 payment not honored for %s: %s", tool, settled.reason)
-            return await _402(send, self.fac.challenge_header(reqs), reqs)
+            # SAY WHY. A bare 402 after a valid signed authorization tells the buyer "pay
+            # again", which is both wrong and useless — they already paid, and now neither
+            # side knows what broke. Every report we got back said only "returned 402", so
+            # every diagnosis was a guess.
+            #
+            # The facilitator's reason goes in the body. The buyer's tooling surfaces it, the
+            # next bug report contains the actual cause, and nobody has to infer anything.
+            log.warning("x402 payment NOT honored for %s: %s | payTo=%s asset=%s amount=%s",
+                        tool, settled.reason, reqs.get("payTo"), reqs.get("asset"),
+                        reqs.get("amount"))
+            return await _402(
+                send, self.fac.challenge_header(reqs), reqs,
+                error=f"payment not settled: {settled.reason}",
+            )
 
         # Paid and settled. Stash the receipt so the tool can return it in the 200 body.
         # NOTHING further to settle — settlement is now behind us, by design.
@@ -393,7 +405,7 @@ def _header(scope: Scope, name: bytes) -> str | None:
     return None
 
 
-async def _402(send: Send, challenge: str, reqs: dict | None = None) -> None:
+async def _402(send: Send, challenge: str, reqs: dict | None = None, error: str | None = None) -> None:
     """A real HTTP 402 that satisfies EVERY x402 client shape we know of.
 
     An OKX admin reported that discovery probes never saw a 402 (they got 406 first — fixed
@@ -414,7 +426,10 @@ async def _402(send: Send, challenge: str, reqs: dict | None = None) -> None:
     """
     body_obj: dict = {
         "x402Version": 2,
-        "error": "payment required",
+        # If a payment was attempted and FAILED, say so specifically. "payment required" is
+        # correct for a first request and actively misleading for a failed settlement.
+        "error": error or "payment required",
+        "payment_attempted": error is not None,
         "accepts_b64": challenge,
     }
     if reqs is not None:
