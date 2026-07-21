@@ -88,8 +88,9 @@ def make_x402_routes(*, fac, store, verifier, price, resource_url: str):
                 "error_code": "bad_body", "charged": False,
             })
 
-        task_id = body.get("task_id")
-        deliverable = body.get("deliverable")
+        task_id = _dig(body, "task_id", "taskId")
+        deliverable = _dig(body, "deliverable", "output", "result")
+
         if not task_id:
             return _json(400, {
                 "error": "task_id is required",
@@ -203,6 +204,37 @@ def make_x402_routes(*, fac, store, verifier, price, resource_url: str):
         }, headers={"x-payment-response": receipt} if receipt else None)
 
     return verify_http
+
+
+def _dig(obj, *keys, _depth: int = 0):
+    """
+    Find the first of `keys` anywhere in a nested JSON body.
+
+    BE LIBERAL IN WHAT YOU ACCEPT. Different buyers wrap the same business arguments
+    differently, and an OKX admin hit exactly this: the x402 replay may arrive as our flat
+    {task_id, deliverable}, as a JSON-RPC envelope
+    ({"params":{"name":...,"arguments":{task_id, deliverable}}}), or echoed inside an x402
+    accepts/challenge structure. Rejecting a paid request because the arguments were one level
+    deeper than expected is a terrible reason to fail — the buyer has already moved money.
+
+    Bounded depth so a hostile or cyclic body cannot spin us.
+    """
+    if _depth > 6 or not isinstance(obj, dict):
+        return None
+    for k in keys:
+        if k in obj and obj[k] not in (None, ""):
+            return obj[k]
+    for v in obj.values():
+        if isinstance(v, dict):
+            found = _dig(v, *keys, _depth=_depth + 1)
+            if found is not None:
+                return found
+        elif isinstance(v, list):
+            for item in v:
+                found = _dig(item, *keys, _depth=_depth + 1)
+                if found is not None:
+                    return found
+    return None
 
 
 def _json(status: int, obj: dict) -> JSONResponse:

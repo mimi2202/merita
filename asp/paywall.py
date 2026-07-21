@@ -112,30 +112,46 @@ class X402Paywall:
 
         body = await _drain(receive)
 
-        # A POST that is NOT valid MCP JSON-RPC, arriving AT THE MCP PATH, is one of two
-        # things — and conflating them was the "endpoint keeps replaying 402" bug.
+        # ── THE TRANSPORT DISCRIMINATOR ──────────────────────────────────────
         #
-        #   (a) NO X-PAYMENT  -> a genuine x402 challenge request. Answer 402 + accepts[].
-        #   (b) WITH X-PAYMENT -> the buyer has ALREADY SIGNED AND SETTLED (tx on-chain) and is
-        #                         replaying to collect the result. Re-challenging here is how we
-        #                         told a paying customer "pay again", forever, after their money
-        #                         had already moved.
+        # Route by the ACCEPT HEADER, not by body shape. This is the fix for a 406 an OKX
+        # admin hit on every call:
         #
-        # Case (b) must be served, not challenged. The registered listing endpoint is /mcp, so
-        # the plain-HTTP buyer never reaches /x402/verify on its own — we route it there by
-        # rewriting the ASGI path. Same handler, same brain, no duplicated logic: /mcp is now
-        # dual-mode, speaking MCP to MCP clients and plain x402 to plain x402 buyers, on the
-        # one URL the marketplace actually advertises.
+        #   "Client must accept both application/json and text/event-stream"
+        #
+        # MCP's streamable-HTTP transport REQUIRES a client to accept text/event-stream.
+        # OKX's x402 buyer (task-402-pay) sends `Accept: application/json` only — so FastMCP
+        # rejected it at the transport layer before any of our payment logic ran. The payment
+        # was signed and never settled, and no verdict was ever produced.
+        #
+        # My previous fix discriminated on the BODY (JSON-RPC vs not), which missed this
+        # entirely: the buyer sends a perfectly valid JSON-RPC body. It sailed past the check
+        # and straight into the 406.
+        #
+        # The header is the honest signal. A client that cannot accept text/event-stream is
+        # NOT an MCP streamable-HTTP client, whatever its body looks like, and must never be
+        # handed to FastMCP. Route it to the plain-HTTP x402 door, which answers stateless
+        # JSON — no session, no SSE.
         _p = scope.get("path", "").rstrip("/")
         _is_mcp = _p.endswith("/mcp") or _p == "/mcp"
-        if _is_mcp and _tool_name(body) is None and not _is_mcp_rpc(body):
+
+        if _is_mcp and not _accepts_sse(scope):
             if _header(scope, b"x-payment"):
+                # Paid replay from a plain-HTTP buyer -> serve the verdict as stateless JSON.
                 rewritten = dict(scope)
                 rewritten["path"] = "/x402/verify"
                 rewritten["raw_path"] = b"/x402/verify"
-                log.info("plain x402 replay on /mcp (payment present) -> /x402/verify")
+                log.info("plain-HTTP buyer (no SSE) with payment -> /x402/verify")
                 return await self.app(rewritten, _replay(body, receive), send)
 
+            # No payment yet -> the x402 challenge. Also stateless JSON.
+            price, desc = self.paid.get("verify_deliverable", (next(iter(self.paid.values()))))
+            reqs = self.fac.requirements(resource_url=self.resource_url, description=desc, price=price)
+            log.info("plain-HTTP buyer (no SSE), unpaid -> 402 challenge")
+            return await _402(send, self.fac.challenge_header(reqs), reqs)
+
+        # Everything below here is a real MCP client (it accepts text/event-stream).
+        if _is_mcp and _tool_name(body) is None and not _is_mcp_rpc(body):
             price, desc = self.paid.get("verify_deliverable", (next(iter(self.paid.values()))))
             reqs = self.fac.requirements(resource_url=self.resource_url, description=desc, price=price)
             return await _402(send, self.fac.challenge_header(reqs), reqs)
@@ -265,6 +281,17 @@ class X402Paywall:
 
 
 # ── ASGI plumbing ────────────────────────────────────────────────────────────
+
+def _accepts_sse(scope: Scope) -> bool:
+    """True if the client accepts text/event-stream — i.e. it is a real MCP streamable-HTTP
+    client. MCP mandates it; OKX's plain x402 buyer does not send it. A missing Accept header
+    is treated as NOT accepting SSE, which is the safe read: a client that did not ask for a
+    stream should not be handed one."""
+    for k, v in scope.get("headers", []):
+        if k.lower() == b"accept":
+            return b"text/event-stream" in v.lower()
+    return False
+
 
 def _is_mcp_rpc(body: bytes) -> bool:
     """True if the body is a JSON-RPC envelope (any method). Distinguishes a real MCP call
