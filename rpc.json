@@ -1,0 +1,1 @@
+﻿{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"verify_deliverable","arguments":{"task_id":"sol-4","deliverable":{"price_usd":142.5}}}}

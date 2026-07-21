@@ -343,6 +343,65 @@ async def _startup() -> None:
         )
 
 
+@mcp.custom_route("/public/commit", methods=["POST", "OPTIONS"])
+async def public_commit(request):
+    """
+    Free, browser-callable commit endpoint — the interactive demo of commit-reveal.
+
+    Committing is free everywhere in Merita (charging for the handshake would make posters
+    skip the step that makes the market honest), so exposing it to a browser costs nothing and
+    demonstrates the core idea: seal a test, then discover you cannot change it.
+
+    NAMESPACED, DELIBERATELY. Every public task_id is prefixed 'public:' server-side. Without
+    that, a stranger could commit to 'sol-4' from a browser and permanently block a paying
+    customer from using that id — a free denial-of-service on real business, delivered through
+    a demo widget. Public writes never touch the namespace real buyers use.
+    """
+    cors = {
+        "access-control-allow-origin": "*",
+        "access-control-allow-headers": "content-type",
+        "access-control-allow-methods": "POST, OPTIONS",
+    }
+    if request.method == "OPTIONS":
+        return JSONResponse({}, headers=cors)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "body must be JSON"}, status_code=400, headers=cors)
+
+    task_id = str(body.get("task_id") or "").strip()
+    source = str(body.get("acceptance_test") or "")
+    spec = str(body.get("spec") or "")
+
+    if not task_id or not source:
+        return JSONResponse(
+            {"error": "task_id and acceptance_test are required"}, status_code=400, headers=cors
+        )
+
+    # Bounded input. A demo endpoint is still a public write path.
+    if len(source) > 4000 or len(spec) > 2000 or len(task_id) > 80:
+        return JSONResponse({"error": "input too large"}, status_code=413, headers=cors)
+
+    namespaced = f"public:{task_id}"
+    try:
+        commitment = store.commit(task_id=namespaced, source=source, spec=spec)
+    except ValueError as e:
+        # THE DEMO'S PUNCHLINE: this task already has a different committed test, and it
+        # cannot be replaced. Returned as a 409, not a 500 — it is the system working.
+        return JSONResponse(
+            {"error": str(e), "refused": True, "reason": "commitment_immutable"},
+            status_code=409, headers=cors,
+        )
+    except Exception as e:
+        log.error("public commit failed: %s", e)
+        return JSONResponse({"error": "commit failed"}, status_code=500, headers=cors)
+
+    return JSONResponse(
+        {"task_id": task_id, "commitment": commitment, "refused": False}, headers=cors
+    )
+
+
 @mcp.custom_route("/internal/verify", methods=["POST"])
 async def internal_verify(request):
     """
@@ -545,6 +604,28 @@ if __name__ == "__main__":
 
     app = X402Paywall(app, facilitator=fac, paid_tools=PAID_TOOLS, resource_url=PUBLIC_URL,
                       precheck=_precheck)
+
+    # CORS, OUTERMOST. A browser sends an OPTIONS preflight before any POST carrying
+    # Content-Type: application/json, and that preflight must be answered with
+    # Access-Control-Allow-* headers before the request reaches a route at all.
+    #
+    # I originally hand-rolled OPTIONS inside /public/commit. That is fragile: the preflight
+    # has to survive every layer above the route, and one early return without the headers
+    # kills it — which is exactly what happened. Real middleware handles the whole preflight
+    # dance once, for every route, and cannot be bypassed by a branch someone adds later.
+    #
+    # allow_origins=["*"] is right here. Every browser-reachable endpoint is either public
+    # read-only (/feed) or free and namespaced (/public/commit), and none accept credentials.
+    # The paid and internal paths are gated by payment and by token — not by who is asking.
+    from starlette.middleware.cors import CORSMiddleware  # noqa: PLC0415
+
+    app = CORSMiddleware(
+        app,
+        allow_origins=["*"],
+        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_headers=["*"],
+        max_age=3600,
+    )
 
     import uvicorn
     log.info("merita up on :%d | x402=%s | tools=%s", port, fac.configured, list(PAID_TOOLS))
