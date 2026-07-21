@@ -1,0 +1,45 @@
+@import "tailwindcss";
+
+/* ── Merita Verdict Ledger ──────────────────────────────────────────────────
+   Aesthetic: an oracle's evidentiary record. Not a crypto dashboard — no neon,
+   no gradients-as-decoration. Ink-dark ground, warm paper-white text, a single
+   decisive pass/fail dichromy (verdict green / slashed red), and monospace for
+   every machine fact (hashes, tx, amounts) because those are quotations from the
+   chain, not prose. The signature: each verdict is a SEALED RECORD. */
+
+@theme {
+  --color-ink: #0e0f0d;          /* near-black, faintly warm */
+  --color-ink-soft: #16181500;   /* unused alpha guard */
+  --color-panel: #17191600;
+  --color-paper: #ece7db;        /* warm off-white, the "ink on paper" */
+  --color-paper-dim: #8f8b7f;    /* muted label text */
+  --color-rule: #2a2c27;         /* hairline dividers */
+  --color-pass: #5faa6a;         /* verdict green — muted, not acid */
+  --color-fail: #c25a54;         /* slashed red — clay, not alarm */
+  --color-seal: #b8923f;         /* brass — the seal / commitment accent */
+
+  --font-display: "Georgia", "Times New Roman", serif;
+  --font-mono: "SF Mono", "JetBrains Mono", "Menlo", monospace;
+}
+
+html { background: var(--color-ink); }
+
+body {
+  margin: 0;
+  background:
+    radial-gradient(120% 80% at 50% -10%, #1a1c18 0%, var(--color-ink) 55%);
+  color: var(--color-paper);
+  font-family: var(--font-mono);
+  -webkit-font-smoothing: antialiased;
+  min-height: 100vh;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .seal-in { animation: sealIn .5s cubic-bezier(.2,.7,.3,1) both; }
+  @keyframes sealIn {
+    from { opacity: 0; transform: translateY(6px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+  .pulse-live { animation: pulseLive 2s ease-in-out infinite; }
+  @keyframes pulseLive { 0%,100% { opacity:.4 } 50% { opacity:1 } }
+}

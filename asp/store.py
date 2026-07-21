@@ -93,7 +93,75 @@ class CommitStore:
                     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
                 )
             """)
-        log.info("commitment store ready")
+            # The verdict log — the explorer reads THIS, and only this. It holds nothing
+            # secret: no test source, no nonce, no keys. Just the public record of what was
+            # judged, whether it passed, and the on-chain tx that paid for it. Safe to serve
+            # to anyone, which is the whole point of an explorer.
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS verdicts (
+                    id          BIGSERIAL PRIMARY KEY,
+                    task_id     TEXT NOT NULL,
+                    passed      BOOLEAN NOT NULL,
+                    confidence  REAL NOT NULL,
+                    reason      TEXT NOT NULL,
+                    commitment  TEXT NOT NULL,
+                    tx_hash     TEXT,
+                    amount      TEXT,
+                    surface     TEXT NOT NULL DEFAULT 'mcp',
+                    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+            """)
+        log.info("commitment + verdict store ready")
+
+    def record_verdict(self, *, task_id: str, passed: bool, confidence: float, reason: str,
+                       commitment: str, tx_hash: str | None, amount: str | None,
+                       surface: str = "mcp") -> None:
+        """Append one verdict to the public log. Best-effort: a logging failure must NEVER
+        break a settlement or withhold a verdict from the buyer who paid for it."""
+        try:
+            with self._pool.connection() as conn:
+                conn.execute(
+                    """INSERT INTO verdicts
+                       (task_id, passed, confidence, reason, commitment, tx_hash, amount, surface)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
+                    (task_id, passed, confidence, reason[:300], commitment, tx_hash, amount, surface),
+                )
+        except Exception as e:
+            log.error("verdict log write failed (non-fatal): %s", e)
+
+    def feed(self, limit: int = 50) -> list[dict]:
+        """Public read model for the explorer. No secrets, ever — this is the ONLY thing the
+        frontend can see, and it can see nothing the whole world couldn't."""
+        limit = max(1, min(limit, 200))
+        try:
+            with self._pool.connection() as conn:
+                rows = conn.execute(
+                    """SELECT task_id, passed, confidence, reason, commitment, tx_hash,
+                              amount, surface, extract(epoch from created_at)::bigint
+                       FROM verdicts ORDER BY id DESC LIMIT %s""",
+                    (limit,),
+                ).fetchall()
+        except Exception as e:
+            log.error("feed read failed: %s", e)
+            return []
+        return [{
+            "task_id": r[0], "passed": r[1], "confidence": r[2], "reason": r[3],
+            "commitment": r[4], "tx_hash": r[5], "amount": r[6], "surface": r[7],
+            "ts": r[8],
+        } for r in rows]
+
+    def stats(self) -> dict:
+        """Headline numbers for the explorer banner."""
+        try:
+            with self._pool.connection() as conn:
+                row = conn.execute(
+                    """SELECT count(*), count(*) FILTER (WHERE passed),
+                              count(*) FILTER (WHERE tx_hash IS NOT NULL)
+                       FROM verdicts"""
+                ).fetchone()
+        except Exception:
+            return {"total": 0, "passed": 0, "settled": 0}
+        return {"total": row[0] or 0, "passed": row[1] or 0, "settled": row[2] or 0}
 
     def commit(self, *, task_id: str, source: str, spec: str) -> str:
         """

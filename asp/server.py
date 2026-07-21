@@ -236,8 +236,8 @@ async def verify_deliverable(task_id: str, deliverable: dict, ctx: Context) -> d
             tx_hash=rc.get("transaction") or rc.get("txHash"),
             amount=(pay.get("reqs") or {}).get("amount"), surface="mcp",
         )
-    except Exception:
-        pass
+    except Exception as e:
+        log.error("verdict log write failed: %s: %s", type(e).__name__, e)
 
     return {
         "task_id": task_id,
@@ -403,8 +403,11 @@ async def internal_verify(request):
             reason=verdict.reason, commitment=rec.commitment, tx_hash=None,
             amount=None, surface="a2a",
         )
-    except Exception:
-        pass
+    except Exception as e:
+        # LOG, never swallow. A bare `except: pass` here once hid an AttributeError from a
+        # half-deployed store module: verdicts silently stopped being recorded, /feed 500'd,
+        # and nothing said why. Best-effort must still be loud-effort.
+        log.error("verdict log write failed: %s: %s", type(e).__name__, e)
 
     return JSONResponse({
         "task_id": task_id,
@@ -421,10 +424,27 @@ async def feed(_request) -> JSONResponse:
     """Public, read-only verdict feed. The explorer polls this. Contains NO secrets —
     no test source, no nonce, no keys — only the public record of what was judged and the
     on-chain tx that paid for it. CORS-open because it's meant to be read from a browser."""
-    return JSONResponse(
-        {"verdicts": store.feed(50), "stats": store.stats()},
-        headers={"access-control-allow-origin": "*"},
-    )
+    try:
+        return JSONResponse(
+            {"verdicts": store.feed(50), "stats": store.stats()},
+            headers={"access-control-allow-origin": "*"},
+        )
+    except AttributeError as e:
+        # The classic half-deploy: server.py is new, store.py is old. Say so explicitly
+        # instead of returning an opaque 500 that could mean anything.
+        log.error("/feed unavailable — store module is out of date: %s", e)
+        return JSONResponse(
+            {"verdicts": [], "stats": {"total": 0, "passed": 0, "settled": 0},
+             "error": "verdict store not migrated — deploy the current asp/store.py"},
+            status_code=503, headers={"access-control-allow-origin": "*"},
+        )
+    except Exception as e:
+        log.exception("/feed failed")
+        return JSONResponse(
+            {"verdicts": [], "stats": {"total": 0, "passed": 0, "settled": 0},
+             "error": f"{type(e).__name__}: {e}"},
+            status_code=500, headers={"access-control-allow-origin": "*"},
+        )
 
 
 @mcp.custom_route("/x402/verify", methods=["POST"])

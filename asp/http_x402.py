@@ -187,8 +187,8 @@ def make_x402_routes(*, fac, store, verifier, price, resource_url: str):
                 reason=verdict.reason, commitment=rec.commitment, tx_hash=tx_hash,
                 amount=reqs.get("amount"), surface="http",
             )
-        except Exception:
-            pass
+        except Exception as e:
+            log.error("verdict log write failed: %s: %s", type(e).__name__, e)
 
         return JSONResponse({
             "task_id": task_id,
