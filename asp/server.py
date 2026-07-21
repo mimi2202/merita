@@ -402,6 +402,73 @@ async def public_commit(request):
     )
 
 
+@mcp.custom_route("/public/verify", methods=["POST", "OPTIONS"])
+async def public_verify(request):
+    """
+    Free verification — DEMO NAMESPACE ONLY. Powers the browser protocol inspector.
+
+    THE OBVIOUS OBJECTION: does a free verify endpoint undercut the paid one? It would, if it
+    could judge anything. It can't. It only serves task_ids that were committed through
+    /public/commit, which the server namespaces to 'public:*'. Real buyers commit through the
+    paid MCP tool into the unprefixed namespace, and those ids are unreachable here.
+
+    So the two paths cannot touch: a stranger can play with a sandbox test they wrote
+    themselves, and cannot verify a single piece of real work without paying. The demo gets to
+    show the whole loop; the business keeps its revenue. If the namespaces ever merged, this
+    endpoint would become a free bypass — which is exactly why the prefix is applied
+    server-side and never accepted from the client.
+    """
+    cors = {"access-control-allow-origin": "*"}
+    if request.method == "OPTIONS":
+        return JSONResponse({}, headers=cors)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "body must be JSON"}, status_code=400, headers=cors)
+
+    task_id = str(body.get("task_id") or "").strip()
+    if not task_id:
+        return JSONResponse({"error": "task_id required"}, status_code=400, headers=cors)
+
+    # Namespace is applied HERE, server-side. Never taken from the client — a client that
+    # could choose its own prefix could reach real commitments and verify them for free.
+    namespaced = f"public:{task_id}"
+    rec = store.get(namespaced)
+    if rec is None:
+        return JSONResponse(
+            {"error": f"no sealed test for demo task '{task_id}' — seal one first",
+             "error_code": "no_commitment"},
+            status_code=404, headers=cors,
+        )
+
+    verdict = await verifier.verify(
+        revealed_source=rec.source,
+        revealed_nonce=rec.nonce,
+        commitment=rec.commitment,
+        deliverable=body.get("deliverable"),
+    )
+
+    try:
+        store.record_verdict(
+            task_id=namespaced, passed=verdict.passed, confidence=verdict.confidence,
+            reason=verdict.reason, commitment=rec.commitment, tx_hash=None,
+            amount=None, surface="demo",
+        )
+    except Exception as e:
+        log.error("verdict log write failed: %s: %s", type(e).__name__, e)
+
+    return JSONResponse({
+        "task_id": task_id,
+        "commitment": rec.commitment,
+        "passed": verdict.passed,
+        "confidence": verdict.confidence,
+        "reason": verdict.reason,
+        "reveal_valid": verdict.reveal_valid,
+        "demo": True,
+    }, headers=cors)
+
+
 @mcp.custom_route("/internal/verify", methods=["POST"])
 async def internal_verify(request):
     """
