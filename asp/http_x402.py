@@ -34,6 +34,7 @@ THE FLOW (synchronous settlement, per OKX docs):
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 
@@ -41,6 +42,10 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 log = logging.getLogger("merita.http_x402")
+
+# Ceiling on a single verification. The sandbox runs the test twice at 10s wall clock each,
+# so 45s leaves headroom for scheduling without ever letting a paid request hang open.
+VERIFY_TIMEOUT_S = 45
 
 
 def make_x402_routes(*, fac, store, verifier, price, resource_url: str):
@@ -51,16 +56,45 @@ def make_x402_routes(*, fac, store, verifier, price, resource_url: str):
     """
 
     async def verify_http(request: Request) -> JSONResponse:
+        # FAIL LOUDLY, NEVER SILENTLY.
+        #
+        # An OKX admin watched a task reach accepted(1) and then produce nothing — the buyer's
+        # process "exited without a result". From the outside, silence is indistinguishable
+        # from a hang, a crash, or a server that simply doesn't care. Worse, a buyer who has
+        # already settled on-chain and receives silence has paid for a void.
+        #
+        # So every path out of this handler returns a STRUCTURED, MACHINE-READABLE result:
+        # an `error` string, an `error_code` a client can branch on, and `charged` so the buyer
+        # always knows whether their money moved. No bare 500s, no empty bodies, no hangs.
+        try:
+            return await _verify_inner(request)
+        except Exception as e:
+            # Unhandled = our bug. Say so plainly, with a code, and a 500 the client can see.
+            log.exception("verify_http failed unexpectedly")
+            return _json(500, {
+                "error": f"internal error: {type(e).__name__}: {e}",
+                "error_code": "internal_error",
+                "charged": None,   # unknown — the client must reconcile against the chain
+                "advice": "retry; if this persists the settlement may need manual reconciliation",
+            })
+
+    async def _verify_inner(request: Request) -> JSONResponse:
         # ── parse the plain JSON body ────────────────────────────────────────
         try:
             body = await request.json()
         except Exception:
-            return _json(400, {"error": "body must be JSON: {task_id, deliverable}"})
+            return _json(400, {
+                "error": "body must be JSON: {task_id, deliverable}",
+                "error_code": "bad_body", "charged": False,
+            })
 
         task_id = body.get("task_id")
         deliverable = body.get("deliverable")
         if not task_id:
-            return _json(400, {"error": "task_id is required"})
+            return _json(400, {
+                "error": "task_id is required",
+                "error_code": "missing_task_id", "charged": False,
+            })
 
         # ── PRE-PAYMENT GATE: never charge for a guaranteed non-verdict ──────
         # Same rule as the MCP door: if there's no committed test, say so for FREE.
@@ -69,7 +103,7 @@ def make_x402_routes(*, fac, store, verifier, price, resource_url: str):
             return _json(200, {
                 "error": f"no committed acceptance test for task '{task_id}'. "
                          f"Commit one first (free). No payment was taken.",
-                "charged": False,
+                "error_code": "no_commitment", "charged": False,
             })
 
         reqs = fac.requirements(
@@ -99,7 +133,8 @@ def make_x402_routes(*, fac, store, verifier, price, resource_url: str):
             log.warning("plain-http x402 payment not honored: %s", settled.reason)
             challenge = fac.challenge_header(reqs)
             return JSONResponse(
-                {"x402Version": 2, "accepts": [reqs], "error": settled.reason},
+                {"x402Version": 2, "accepts": [reqs], "error": settled.reason,
+                 "error_code": "payment_not_honored", "charged": False},
                 status_code=402,
                 headers={"payment-required": challenge},
             )
@@ -107,16 +142,51 @@ def make_x402_routes(*, fac, store, verifier, price, resource_url: str):
         # ── PAID. Run the sandbox and return the verdict IN THE BODY. ───────
         # This is the whole point of the plain-HTTP door: synchronous settlement means the
         # deliverable comes back in this 200, not behind a session the buyer never opens.
-        verdict = await verifier.verify(
-            revealed_source=rec.source,
-            revealed_nonce=rec.nonce,
-            commitment=rec.commitment,
-            deliverable=deliverable,
-        )
+        # HARD TIMEOUT. The sandbox has its own internal wall clock, but a hung HTTP call to
+        # an isolated verifier, or a stuck thread, would otherwise leave the buyer waiting
+        # forever on a request they have already paid for. Better a loud, explicit timeout the
+        # client can act on than a socket that never closes.
+        try:
+            verdict = await asyncio.wait_for(
+                verifier.verify(
+                    revealed_source=rec.source,
+                    revealed_nonce=rec.nonce,
+                    commitment=rec.commitment,
+                    deliverable=deliverable,
+                ),
+                timeout=VERIFY_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError:
+            log.error("verify timed out after %ss for task %s", VERIFY_TIMEOUT_S, task_id)
+            # The buyer HAS PAID. Tell them exactly that, and that this is not their fault and
+            # not a failed deliverable — it is our infrastructure. Never let a timeout read as
+            # a verdict of "failed".
+            return _json(503, {
+                "task_id": task_id,
+                "error": f"verification timed out after {VERIFY_TIMEOUT_S}s",
+                "error_code": "verify_timeout",
+                "charged": True,
+                "passed": None,
+                "advice": "this is a referee-side failure, not a failed deliverable; retry or "
+                          "escalate — do not treat as a rejection",
+            })
 
         receipt = None
+        tx_hash = None
         try:
-            receipt = fac.receipt_header(settled.receipt) if settled.receipt else None
+            if settled.receipt:
+                receipt = fac.receipt_header(settled.receipt)
+                tx_hash = settled.receipt.get("transaction") or settled.receipt.get("txHash")
+        except Exception:
+            pass
+
+        # Record to the public verdict log (the explorer reads this). Best-effort.
+        try:
+            store.record_verdict(
+                task_id=task_id, passed=verdict.passed, confidence=verdict.confidence,
+                reason=verdict.reason, commitment=rec.commitment, tx_hash=tx_hash,
+                amount=reqs.get("amount"), surface="http",
+            )
         except Exception:
             pass
 

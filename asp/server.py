@@ -47,6 +47,7 @@ verify → work → settle. Never merge them. That ordering is why x402 has two 
 
 from __future__ import annotations
 
+import hmac
 import logging
 import os
 from typing import Any
@@ -224,6 +225,20 @@ async def verify_deliverable(task_id: str, deliverable: dict, ctx: Context) -> d
 
     receipt = await _settle()
 
+    # Record to the public verdict log for the explorer. Best-effort; never blocks the verdict.
+    try:
+        req = get_http_request()
+        pay = req.scope.get("merita_payment", {})
+        rc = pay.get("receipt") or {}
+        store.record_verdict(
+            task_id=task_id, passed=verdict.passed, confidence=verdict.confidence,
+            reason=verdict.reason, commitment=rec.commitment,
+            tx_hash=rc.get("transaction") or rc.get("txHash"),
+            amount=(pay.get("reqs") or {}).get("amount"), surface="mcp",
+        )
+    except Exception:
+        pass
+
     return {
         "task_id": task_id,
         "passed": verdict.passed,
@@ -326,6 +341,90 @@ async def _startup() -> None:
             "SANDBOX SELF-TEST FAILED. verify_deliverable will take payment and return a "
             "non-verdict. DO NOT serve traffic in this state."
         )
+
+
+@mcp.custom_route("/internal/verify", methods=["POST"])
+async def internal_verify(request):
+    """
+    Verdict endpoint for Merita's OWN A2A delivery worker. Token-gated, not payment-gated.
+
+    WHY THIS EXISTS: the A2A worker (asp/a2a_worker.py) runs locally, holds the wallet, and
+    delivers task results on-chain. It needs a verdict. Making it pay the public x402 price
+    would mean Merita paying Merita — economically meaningless, and on a marketplace that
+    disqualifies self-dealing, actively harmful: our own integrity graph would flag the
+    resulting wallet-to-wallet loop. So the worker authenticates as us instead of paying as
+    a stranger.
+
+    FAILS CLOSED. If MERITA_WORKER_TOKEN is unset, this endpoint refuses every request. An
+    un-gated free verification endpoint sitting next to a paid one is a bypass, and the kind
+    that gets found. No token, no service — never a default-open.
+
+    It grants no extra power: it still requires a committed acceptance test, and it runs the
+    identical sandbox the paid path uses. It skips the paywall, not the referee.
+    """
+    token = os.environ.get("MERITA_WORKER_TOKEN", "")
+    if not token:
+        return JSONResponse(
+            {"error": "internal endpoint disabled (MERITA_WORKER_TOKEN unset)"}, status_code=503
+        )
+
+    supplied = request.headers.get("x-worker-token", "")
+    # Constant-time compare: a plain == leaks token bytes through timing to anyone patient.
+    if not hmac.compare_digest(supplied, token):
+        log.warning("internal/verify: bad worker token from %s", request.client)
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "body must be JSON"}, status_code=400)
+
+    task_id = body.get("task_id")
+    if not task_id:
+        return JSONResponse({"error": "task_id required"}, status_code=400)
+
+    rec = store.get(task_id)
+    if rec is None:
+        return JSONResponse(
+            {"error": f"no committed acceptance test for task '{task_id}'", "verdict": None},
+            status_code=404,
+        )
+
+    verdict = await verifier.verify(
+        revealed_source=rec.source,
+        revealed_nonce=rec.nonce,
+        commitment=rec.commitment,
+        deliverable=body.get("deliverable"),
+    )
+
+    try:
+        store.record_verdict(
+            task_id=task_id, passed=verdict.passed, confidence=verdict.confidence,
+            reason=verdict.reason, commitment=rec.commitment, tx_hash=None,
+            amount=None, surface="a2a",
+        )
+    except Exception:
+        pass
+
+    return JSONResponse({
+        "task_id": task_id,
+        "commitment": rec.commitment,
+        "passed": verdict.passed,
+        "confidence": verdict.confidence,
+        "reason": verdict.reason,
+        "reveal_valid": verdict.reveal_valid,
+    })
+
+
+@mcp.custom_route("/feed", methods=["GET"])
+async def feed(_request) -> JSONResponse:
+    """Public, read-only verdict feed. The explorer polls this. Contains NO secrets —
+    no test source, no nonce, no keys — only the public record of what was judged and the
+    on-chain tx that paid for it. CORS-open because it's meant to be read from a browser."""
+    return JSONResponse(
+        {"verdicts": store.feed(50), "stats": store.stats()},
+        headers={"access-control-allow-origin": "*"},
+    )
 
 
 @mcp.custom_route("/x402/verify", methods=["POST"])

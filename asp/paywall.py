@@ -112,12 +112,30 @@ class X402Paywall:
 
         body = await _drain(receive)
 
-        # A POST that is NOT valid MCP JSON-RPC, arriving AT THE MCP PATH, is also a probe —
-        # answer it with a 402 rather than letting FastMCP 406 it on the Accept header. Scoped
-        # to /mcp so a malformed POST to any other route is left entirely alone.
+        # A POST that is NOT valid MCP JSON-RPC, arriving AT THE MCP PATH, is one of two
+        # things — and conflating them was the "endpoint keeps replaying 402" bug.
+        #
+        #   (a) NO X-PAYMENT  -> a genuine x402 challenge request. Answer 402 + accepts[].
+        #   (b) WITH X-PAYMENT -> the buyer has ALREADY SIGNED AND SETTLED (tx on-chain) and is
+        #                         replaying to collect the result. Re-challenging here is how we
+        #                         told a paying customer "pay again", forever, after their money
+        #                         had already moved.
+        #
+        # Case (b) must be served, not challenged. The registered listing endpoint is /mcp, so
+        # the plain-HTTP buyer never reaches /x402/verify on its own — we route it there by
+        # rewriting the ASGI path. Same handler, same brain, no duplicated logic: /mcp is now
+        # dual-mode, speaking MCP to MCP clients and plain x402 to plain x402 buyers, on the
+        # one URL the marketplace actually advertises.
         _p = scope.get("path", "").rstrip("/")
         _is_mcp = _p.endswith("/mcp") or _p == "/mcp"
         if _is_mcp and _tool_name(body) is None and not _is_mcp_rpc(body):
+            if _header(scope, b"x-payment"):
+                rewritten = dict(scope)
+                rewritten["path"] = "/x402/verify"
+                rewritten["raw_path"] = b"/x402/verify"
+                log.info("plain x402 replay on /mcp (payment present) -> /x402/verify")
+                return await self.app(rewritten, _replay(body, receive), send)
+
             price, desc = self.paid.get("verify_deliverable", (next(iter(self.paid.values()))))
             reqs = self.fac.requirements(resource_url=self.resource_url, description=desc, price=price)
             return await _402(send, self.fac.challenge_header(reqs), reqs)
@@ -229,6 +247,13 @@ class X402Paywall:
         is_mcp_path = path.rstrip("/").endswith("/mcp") or path.rstrip("/") == "/mcp"
         if not is_mcp_path:
             return False
+
+        # A request carrying a payment is NEVER a probe — it is a replay collecting a result.
+        # Without this, a buyer who signals x402 in its headers AND pays would be re-challenged
+        # forever, having already settled on-chain.
+        for k, v in scope.get("headers", []):
+            if k.lower() == b"x-payment" and v:
+                return False
 
         if scope["method"] == "GET":
             return True
