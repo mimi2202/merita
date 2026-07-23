@@ -74,7 +74,7 @@ PUBLIC_URL = os.environ.get("MERITA_PUBLIC_URL", "https://merita-asp.onrender.co
 # Half this project's debugging time was spent unable to answer "is my fix actually live?".
 # A response shape can look right while the code behind it is three commits old. /health now
 # reports this, so one curl settles it — no more inferring deployment state from behaviour.
-BUILD = "2026-07-22.multi-header-payment+log-first"
+BUILD = "2026-07-23.single-shot-verify"
 
 fac = Facilitator()
 store = CommitStore()          # raises at boot if DATABASE_URL is unset. That is intentional.

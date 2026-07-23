@@ -90,6 +90,7 @@ def make_x402_routes(*, fac, store, verifier, price, resource_url: str):
 
         task_id = _dig(body, "task_id", "taskId")
         deliverable = _dig(body, "deliverable", "output", "result")
+        inline_test = _dig(body, "acceptance_test", "acceptanceTest", "test", "check")
 
         if not task_id:
             return _json(400, {
@@ -97,15 +98,68 @@ def make_x402_routes(*, fac, store, verifier, price, resource_url: str):
                 "error_code": "missing_task_id", "charged": False,
             })
 
-        # ── PRE-PAYMENT GATE: never charge for a guaranteed non-verdict ──────
-        # Same rule as the MCP door: if there's no committed test, say so for FREE.
+        # ── TWO MODES, AND THE VERDICT SAYS WHICH ONE RAN ────────────────────
+        #
+        # OKX rejected the listing because "results returned in actual calls don't match the
+        # capabilities stated in the description". They were right, and the cause was
+        # structural: verification REQUIRED a separate prior commit call, but the listing
+        # exposes exactly one endpoint. A caller using the listed service could therefore only
+        # ever receive "no committed test" — never the pass/fail verdict the description
+        # promises. The service could not do the thing it advertised.
+        #
+        # So the endpoint is now single-shot: send the test with the deliverable and get a
+        # verdict immediately.
+        #
+        # WHAT THAT COSTS, STATED PLAINLY: commit-reveal's guarantee is that the test was
+        # sealed BEFORE the work was seen. A test supplied in the same call carries no such
+        # proof — the poster could have written it after reading the deliverable. That is a
+        # real weakening, and hiding it would make the verdict a lie.
+        #
+        # So we do not hide it. `precommitted` is returned on every verdict:
+        #   true  — the test was sealed in advance; neither side could move the goalposts
+        #   false — the test arrived with the deliverable; judged honestly, but unprotected
+        #
+        # The strong mode remains available and is strictly better. The weak mode makes the
+        # service usable on first contact. The caller is told, every time, which one they got.
         rec = store.get(task_id)
+        precommitted = rec is not None
+
         if rec is None:
-            return _json(200, {
-                "error": f"no committed acceptance test for task '{task_id}'. "
-                         f"Commit one first (free). No payment was taken.",
-                "error_code": "no_commitment", "charged": False,
-            })
+            if not inline_test:
+                return _json(200, {
+                    "error": (
+                        f"no acceptance test for task '{task_id}'. Send one as "
+                        f"'acceptance_test' in this call, or commit it in advance for "
+                        f"tamper-proof verification."
+                    ),
+                    "error_code": "no_test_supplied",
+                    "charged": False,
+                    "expected_body": {
+                        "task_id": "<your id>",
+                        "acceptance_test": "def check(output) -> bool: ...",
+                        "deliverable": {"...": "the worker's output as JSON"},
+                    },
+                })
+
+            # Seal the inline test now, so the verdict still references a real commitment
+            # hash and the whole exchange remains auditable after the fact.
+            try:
+                store.commit(task_id=task_id, source=inline_test, spec="supplied inline")
+                rec = store.get(task_id)
+            except ValueError:
+                # A different test is already committed for this id. Do NOT let an inline
+                # test override a sealed one — that would be goalpost-moving through the
+                # back door, which is the exact attack commit-reveal exists to stop.
+                rec = store.get(task_id)
+                precommitted = True
+            except Exception as e:
+                log.error("inline commit failed: %s", e)
+                return _json(500, {"error": "could not record the acceptance test",
+                                   "error_code": "commit_failed", "charged": False})
+
+        if rec is None:
+            return _json(500, {"error": "acceptance test unavailable",
+                               "error_code": "no_commitment", "charged": False})
 
         reqs = fac.requirements(
             resource_url=resource_url,
@@ -199,6 +253,11 @@ def make_x402_routes(*, fac, store, verifier, price, resource_url: str):
             "reveal_valid": verdict.reveal_valid,
             "commitment": rec.commitment,
             "settle_escrow": verdict.passed,
+            # Disclosed on EVERY verdict. true = the test was sealed before the deliverable
+            # was seen (tamper-proof). false = it arrived in this call (judged honestly, but
+            # with no proof it predates the work). A referee that hides which guarantee it
+            # actually provided is not a referee.
+            "precommitted": precommitted,
             "charged": True,
             "payment_receipt": receipt,
         }, headers={"x-payment-response": receipt} if receipt else None)
