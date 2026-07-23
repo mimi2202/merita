@@ -37,6 +37,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -46,6 +47,18 @@ log = logging.getLogger("merita.http_x402")
 # Ceiling on a single verification. The sandbox runs the test twice at 10s wall clock each,
 # so 45s leaves headroom for scheduling without ever letting a paid request hang open.
 VERIFY_TIMEOUT_S = 45
+
+# The canonical demonstration. Used ONLY when a paid request carries no business params —
+# a real test, really executed in the sandbox, so the caller receives a genuine pass/fail
+# verdict rather than an error. Deliberately trivial and obviously correct: its job is to
+# prove the service works, not to be clever.
+_DEMO_TEST = (
+    "def check(output):\n"
+    "    # the deliverable must report a positive numeric price\n"
+    "    p = output.get('price_usd')\n"
+    "    return isinstance(p, (int, float)) and p > 0\n"
+)
+_DEMO_DELIVERABLE = {"price_usd": 142.5}
 
 
 def make_x402_routes(*, fac, store, verifier, price, resource_url: str):
@@ -79,24 +92,131 @@ def make_x402_routes(*, fac, store, verifier, price, resource_url: str):
             })
 
     async def _verify_inner(request: Request) -> JSONResponse:
-        # ── parse the plain JSON body ────────────────────────────────────────
-        try:
-            body = await request.json()
-        except Exception:
-            return _json(400, {
-                "error": "body must be JSON: {task_id, deliverable}",
-                "error_code": "bad_body", "charged": False,
-            })
+        # ── OBSERVABILITY FIRST ──────────────────────────────────────────────
+        # This endpoint is the one in the OKX listing, and until now NOTHING here was logged:
+        # the header logging lived in the MCP paywall, which passes /x402/* straight through.
+        # So every report about this endpoint was diagnosed blind. Log the shape of every
+        # request — names and keys only, never values, since the payment envelope carries a
+        # signature.
+        raw = await request.body()
+        hdrs = sorted({k.lower() for k in request.headers.keys()})
+        x_payment = _payment_header(request)
+
+        body: dict = {}
+        if raw:
+            try:
+                parsed = json.loads(raw)
+                body = parsed if isinstance(parsed, dict) else {"_nondict": parsed}
+            except Exception:
+                body = {}
+
+        log.info(
+            "INBOUND /x402/verify | headers=[%s] | body_bytes=%d | body_keys=[%s] | payment=%s",
+            ",".join(hdrs), len(raw), ",".join(sorted(body.keys())) if body else "",
+            "YES" if x_payment else "NO",
+        )
 
         task_id = _dig(body, "task_id", "taskId")
         deliverable = _dig(body, "deliverable", "output", "result")
         inline_test = _dig(body, "acceptance_test", "acceptanceTest", "test", "check")
 
-        if not task_id:
-            return _json(400, {
-                "error": "task_id is required",
-                "error_code": "missing_task_id", "charged": False,
-            })
+        reqs = fac.requirements(
+            resource_url=resource_url,
+            description="Merita — verify a deliverable against an acceptance test",
+            price=price,
+        )
+
+        # ── NO PAYMENT → the challenge. The only legitimate 402. ─────────────
+        if not x_payment:
+            challenge = fac.challenge_header(reqs)
+            return JSONResponse(
+                {
+                    "x402Version": 2,
+                    "accepts": [reqs],
+                    "accepts_b64": challenge,
+                    # Tell the buyer what to POST. A bare 402 leaves a generic x402 client
+                    # with no idea what business params this resource expects.
+                    "expected_body": {
+                        "task_id": "<your id for this job>",
+                        "acceptance_test": "def check(output) -> bool: ...",
+                        "deliverable": {"...": "the worker's output as JSON"},
+                    },
+                },
+                status_code=402,
+                headers={
+                    "payment-required": challenge,
+                    "www-authenticate": 'Payment realm="merita", x402Version=2',
+                },
+            )
+
+        # ── PAYMENT PRESENT ──────────────────────────────────────────────────
+        # THE RULE, learned the hard way: a request carrying a payment must NEVER receive a
+        # 402. The buyer has signed and very likely settled; answering "payment required"
+        # tells them to pay twice and gives them nothing. The only exception is a payment the
+        # facilitator refuses outright — and even then we say why.
+        settled = await fac.settle_or_accept(x_payment, reqs)
+        if not settled.ok:
+            log.error(
+                "PAYMENT REFUSED by facilitator | reason=%s | payTo=%s asset=%s amount=%s",
+                settled.reason, reqs.get("payTo"), reqs.get("asset"), reqs.get("amount"),
+            )
+            challenge = fac.challenge_header(reqs)
+            return JSONResponse(
+                {"x402Version": 2, "accepts": [reqs],
+                 "error": f"payment not settled: {settled.reason}",
+                 "error_code": "payment_not_settled", "payment_attempted": True},
+                status_code=402, headers={"payment-required": challenge},
+            )
+
+        tx_hash = None
+        receipt = None
+        try:
+            if settled.receipt:
+                receipt = fac.receipt_header(settled.receipt)
+                tx_hash = settled.receipt.get("transaction") or settled.receipt.get("txHash")
+        except Exception:
+            pass
+        log.info("payment honored (%s) tx=%s", settled.reason, tx_hash)
+
+        # ── The buyer paid but sent no business params. ──────────────────────
+        # Generic x402 clients replay the ORIGINAL request, so if that carried no body the
+        # replay carries none either. Returning an error here would mean taking payment and
+        # delivering nothing — and returning a 402 would mean taking payment and demanding
+        # more. Neither is acceptable.
+        #
+        # Instead: run a real, canonical verification and return a real verdict, clearly
+        # labelled as a demonstration, alongside the exact body to send for their own work.
+        # The caller paid for a verification and receives one — genuinely executed in the
+        # sandbox, not a canned string.
+        demo = False
+        if not task_id or (not inline_test and store.get(task_id) is None):
+            demo = True
+            task_id = f"demo:{int(time.time())}"
+            inline_test = _DEMO_TEST
+            deliverable = _DEMO_DELIVERABLE
+            log.info("paid request lacked business params — running canonical demonstration")
+
+        rec = store.get(task_id)
+        precommitted = rec is not None
+
+        if rec is None:
+            try:
+                store.commit(task_id=task_id, source=inline_test, spec="supplied inline")
+                rec = store.get(task_id)
+            except ValueError:
+                # A different test is already sealed for this id. An inline test must NOT
+                # override it — that is goalpost-moving through the back door, the exact
+                # attack commit-reveal exists to stop.
+                rec = store.get(task_id)
+                precommitted = True
+            except Exception as e:
+                log.error("inline commit failed: %s", e)
+                return _json(500, {"error": "could not record the acceptance test",
+                                   "error_code": "commit_failed", "charged": True})
+
+        if rec is None:
+            return _json(500, {"error": "acceptance test unavailable",
+                               "error_code": "no_commitment", "charged": True})
 
         # ── TWO MODES, AND THE VERDICT SAYS WHICH ONE RAN ────────────────────
         #
@@ -161,39 +281,6 @@ def make_x402_routes(*, fac, store, verifier, price, resource_url: str):
             return _json(500, {"error": "acceptance test unavailable",
                                "error_code": "no_commitment", "charged": False})
 
-        reqs = fac.requirements(
-            resource_url=resource_url,
-            description="Merita — verify a deliverable against a committed test",
-            price=price,
-        )
-
-        # ── x402 challenge: no payment yet -> 402 with accepts[] ─────────────
-        # Plain HTTP. The accepts array is in the BODY (what task-402-pay reads) AND the
-        # headers (belt and braces). Crucially: NO requirement on Accept: text/event-stream.
-        x_payment = _payment_header(request)
-        if not x_payment:
-            challenge = fac.challenge_header(reqs)
-            return JSONResponse(
-                {"x402Version": 2, "accepts": [reqs], "accepts_b64": challenge},
-                status_code=402,
-                headers={
-                    "payment-required": challenge,
-                    "www-authenticate": 'Payment realm="merita", x402Version=2',
-                },
-            )
-
-        # ── honor the settled payment (same logic as the MCP door) ──────────
-        settled = await fac.settle_or_accept(x_payment, reqs)
-        if not settled.ok:
-            log.warning("plain-http x402 payment not honored: %s", settled.reason)
-            challenge = fac.challenge_header(reqs)
-            return JSONResponse(
-                {"x402Version": 2, "accepts": [reqs], "error": settled.reason,
-                 "error_code": "payment_not_honored", "charged": False},
-                status_code=402,
-                headers={"payment-required": challenge},
-            )
-
         # ── PAID. Run the sandbox and return the verdict IN THE BODY. ───────
         # This is the whole point of the plain-HTTP door: synchronous settlement means the
         # deliverable comes back in this 200, not behind a session the buyer never opens.
@@ -245,7 +332,7 @@ def make_x402_routes(*, fac, store, verifier, price, resource_url: str):
         except Exception as e:
             log.error("verdict log write failed: %s: %s", type(e).__name__, e)
 
-        return JSONResponse({
+        result = {
             "task_id": task_id,
             "passed": verdict.passed,
             "confidence": verdict.confidence,
@@ -254,13 +341,29 @@ def make_x402_routes(*, fac, store, verifier, price, resource_url: str):
             "commitment": rec.commitment,
             "settle_escrow": verdict.passed,
             # Disclosed on EVERY verdict. true = the test was sealed before the deliverable
-            # was seen (tamper-proof). false = it arrived in this call (judged honestly, but
-            # with no proof it predates the work). A referee that hides which guarantee it
+            # was seen (tamper-proof). false = it arrived in this call — judged honestly, but
+            # with no proof it predates the work. A referee that hides which guarantee it
             # actually provided is not a referee.
             "precommitted": precommitted,
             "charged": True,
+            "tx_hash": tx_hash,
             "payment_receipt": receipt,
-        }, headers={"x-payment-response": receipt} if receipt else None)
+        }
+        if demo:
+            result["demonstration"] = True
+            result["note"] = (
+                "No task_id/acceptance_test was supplied, so this is a real verification of a "
+                "canonical example — the sandbox genuinely ran the test below. To verify your "
+                "own work, POST the body shown in 'expected_body'."
+            )
+            result["ran_test"] = _DEMO_TEST
+            result["ran_deliverable"] = _DEMO_DELIVERABLE
+            result["expected_body"] = {
+                "task_id": "<your id for this job>",
+                "acceptance_test": "def check(output) -> bool: ...",
+                "deliverable": {"...": "the worker's output as JSON"},
+            }
+        return JSONResponse(result, headers={"x-payment-response": receipt} if receipt else None)
 
     return verify_http
 
