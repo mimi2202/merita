@@ -35,6 +35,7 @@ THE FLOW (synchronous settlement, per OKX docs):
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import time
@@ -100,7 +101,7 @@ def make_x402_routes(*, fac, store, verifier, price, resource_url: str):
         # signature.
         raw = await request.body()
         hdrs = sorted({k.lower() for k in request.headers.keys()})
-        x_payment = _payment_header(request)
+        _pay_name, x_payment = _payment_header(request)
 
         body: dict = {}
         if raw:
@@ -111,9 +112,10 @@ def make_x402_routes(*, fac, store, verifier, price, resource_url: str):
                 body = {}
 
         log.info(
-            "INBOUND /x402/verify | headers=[%s] | body_bytes=%d | body_keys=[%s] | payment=%s",
+            "INBOUND /x402/verify | headers=[%s] | body_bytes=%d | body_keys=[%s] | payment=%s%s",
             ",".join(hdrs), len(raw), ",".join(sorted(body.keys())) if body else "",
             "YES" if x_payment else "NO",
+            (" | " + _describe_payment(_pay_name, x_payment)) if x_payment else "",
         )
 
         task_id = _dig(body, "task_id", "taskId")
@@ -161,10 +163,30 @@ def make_x402_routes(*, fac, store, verifier, price, resource_url: str):
                 settled.reason, reqs.get("payTo"), reqs.get("asset"), reqs.get("amount"),
             )
             challenge = fac.challenge_header(reqs)
+            # SELF-DIAGNOSING FAILURE. The reason travels in the response, not only in our
+            # logs — so a buyer's bug report contains the cause instead of just the symptom.
+            # Every "rejected on replay" round-trip so far cost a day precisely because the
+            # response said nothing.
             return JSONResponse(
-                {"x402Version": 2, "accepts": [reqs],
-                 "error": f"payment not settled: {settled.reason}",
-                 "error_code": "payment_not_settled", "payment_attempted": True},
+                {
+                    "x402Version": 2,
+                    "accepts": [reqs],
+                    "error": f"payment not settled: {settled.reason}",
+                    "error_code": "payment_not_settled",
+                    "payment_attempted": True,
+                    "diagnostic": {
+                        "facilitator_reason": settled.reason,
+                        "advertised_payTo": reqs.get("payTo"),
+                        "advertised_amount": reqs.get("amount"),
+                        "advertised_asset": reqs.get("asset"),
+                        "network": reqs.get("network"),
+                        "hint": (
+                            "If your signed authorization's recipient/amount differ from the "
+                            "advertised values above, re-request the 402 challenge and sign "
+                            "against the current terms."
+                        ),
+                    },
+                },
                 status_code=402, headers={"payment-required": challenge},
             )
 
@@ -372,18 +394,51 @@ def make_x402_routes(*, fac, store, verifier, price, resource_url: str):
 # alongside the value, which means it is configurable at their end — so gating on the single
 # spec name `X-PAYMENT` silently rejected paying customers as if they had never paid. Accept
 # every plausible name; a payment we cannot recognise is worse than one we reject out loud.
+# `payment-signature` FIRST — it is what OKX's task-402-pay actually sends, confirmed from
+# production logs. Gating on the spec name `X-PAYMENT` alone meant a signed authorization
+# arrived and was invisible: the buyer paid, we saw nothing, and challenged them again.
 _PAYMENT_HEADERS = (
+    "payment-signature", "x-payment-signature",
     "x-payment", "payment", "x-payment-authorization", "authorization-payment",
     "x-402-payment", "x402-payment", "payment-authorization",
 )
 
 
-def _payment_header(request) -> str | None:
+def _payment_header(request) -> tuple[str, str] | tuple[None, None]:
+    """Return (header_name, value) for the first recognised payment header."""
     for name in _PAYMENT_HEADERS:
         v = request.headers.get(name)
         if v:
-            return v
-    return None
+            return name, v
+    return None, None
+
+
+def _describe_payment(name: str, value: str) -> str:
+    """
+    Describe the SHAPE of a payment envelope for the log — never its contents.
+
+    We accepted `payment-signature` on the evidence that OKX's buyer sends it, but we do not
+    yet know what it CONTAINS: a base64 JSON envelope, a bare hex signature, or something
+    else. Rather than assume and be wrong for another round, describe the structure — length,
+    and if it decodes to JSON, its top-level keys. Signature and authorization VALUES are
+    never logged; only shape.
+    """
+    bits = [f"header={name}", f"len={len(value)}"]
+    try:
+        obj = json.loads(base64.b64decode(value, validate=False))
+        if isinstance(obj, dict):
+            bits.append(f"b64_json_keys={sorted(obj.keys())}")
+            inner = obj.get("payload")
+            if isinstance(inner, dict):
+                bits.append(f"payload_keys={sorted(inner.keys())}")
+        else:
+            bits.append(f"b64_json_type={type(obj).__name__}")
+    except Exception:
+        if value.startswith("0x"):
+            bits.append("shape=hex (bare signature? an authorization must accompany it)")
+        else:
+            bits.append("shape=opaque (not base64-JSON)")
+    return " ".join(bits)
 
 
 def _dig(obj, *keys, _depth: int = 0):

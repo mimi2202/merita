@@ -300,8 +300,9 @@ class X402Paywall:
         # Without this, a buyer who signals x402 in its headers AND pays would be re-challenged
         # forever, having already settled on-chain.
         for k, v in scope.get("headers", []):
-            if k.lower() in (b"x-payment", b"payment", b"x-payment-authorization",
-                             b"x-402-payment", b"x402-payment") and v:
+            if k.lower() in (b"payment-signature", b"x-payment-signature", b"x-payment",
+                             b"payment", b"x-payment-authorization", b"x-402-payment",
+                             b"x402-payment", b"payment-authorization") and v:
                 return False
 
         if scope["method"] == "GET":
@@ -329,12 +330,24 @@ def _payment_header(scope: Scope) -> str | None:
     So: accept every plausible name. A payment we fail to recognise is worse than one we
     recognise and reject — the second at least tells everyone what happened.
     """
+    # `payment-signature` is FIRST because it is what OKX's task-402-pay actually sends.
+    # Confirmed from production logs on 2026-07-23:
+    #
+    #   INBOUND /x402/verify | headers=[...,payment-signature,...] | payment=NO
+    #
+    # I had assumed the x402 spec name `X-PAYMENT` and gated everything on it, so a fully
+    # signed EIP-3009 authorization arrived, was ignored, and the buyer was told to pay for
+    # something they had already paid for — three reports in a row, none of which could be
+    # diagnosed until the header names themselves were logged. Assume nothing about a wire
+    # format you can observe.
     names = (
+        b"payment-signature", b"x-payment-signature",
         b"x-payment", b"payment", b"x-payment-authorization", b"authorization-payment",
         b"x-402-payment", b"x402-payment", b"payment-authorization",
     )
     for k, v in scope.get("headers", []):
         if k.lower() in names and v:
+            log.info("payment envelope found in header %r", k.decode())
             return v.decode()
     return None
 
