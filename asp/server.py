@@ -69,6 +69,13 @@ log = logging.getLogger("merita")
 
 PUBLIC_URL = os.environ.get("MERITA_PUBLIC_URL", "https://merita-asp.onrender.com/mcp")
 
+# BUILD MARKER. Bump this on every deploy that changes request handling.
+#
+# Half this project's debugging time was spent unable to answer "is my fix actually live?".
+# A response shape can look right while the code behind it is three commits old. /health now
+# reports this, so one curl settles it — no more inferring deployment state from behaviour.
+BUILD = "2026-07-22.multi-header-payment+log-first"
+
 fac = Facilitator()
 store = CommitStore()          # raises at boot if DATABASE_URL is unset. That is intentional.
 verifier = VerifierClient()
@@ -611,6 +618,13 @@ async def health(_request) -> JSONResponse:
         # migrates USDT (they already have once, to USDT0), set MERITA_SETTLEMENT_ASSET.
         "settlement_asset": fac.token.address,
         "exact_scheme_supported": fac.supported,
+        "build": BUILD,
+        # Which header names this build will accept a payment under. If a buyer's header is
+        # not in this list, its payment is invisible to us and it will be re-challenged.
+        "accepted_payment_headers": [
+            "x-payment", "payment", "x-payment-authorization", "authorization-payment",
+            "x-402-payment", "x402-payment", "payment-authorization",
+        ],
         # If this is not true, the referee cannot referee. Everything else being green is
         # worse than useless — it means we will charge for verdicts we cannot render.
         "sandbox": SANDBOX_OK,

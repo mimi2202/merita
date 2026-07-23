@@ -116,7 +116,7 @@ def make_x402_routes(*, fac, store, verifier, price, resource_url: str):
         # ── x402 challenge: no payment yet -> 402 with accepts[] ─────────────
         # Plain HTTP. The accepts array is in the BODY (what task-402-pay reads) AND the
         # headers (belt and braces). Crucially: NO requirement on Accept: text/event-stream.
-        x_payment = request.headers.get("x-payment")
+        x_payment = _payment_header(request)
         if not x_payment:
             challenge = fac.challenge_header(reqs)
             return JSONResponse(
@@ -204,6 +204,24 @@ def make_x402_routes(*, fac, store, verifier, price, resource_url: str):
         }, headers={"x-payment-response": receipt} if receipt else None)
 
     return verify_http
+
+
+# Buyers do not agree on the payment header's name. OKX's CLI returns a `header_name`
+# alongside the value, which means it is configurable at their end — so gating on the single
+# spec name `X-PAYMENT` silently rejected paying customers as if they had never paid. Accept
+# every plausible name; a payment we cannot recognise is worse than one we reject out loud.
+_PAYMENT_HEADERS = (
+    "x-payment", "payment", "x-payment-authorization", "authorization-payment",
+    "x-402-payment", "x402-payment", "payment-authorization",
+)
+
+
+def _payment_header(request) -> str | None:
+    for name in _PAYMENT_HEADERS:
+        v = request.headers.get(name)
+        if v:
+            return v
+    return None
 
 
 def _dig(obj, *keys, _depth: int = 0):

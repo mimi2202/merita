@@ -77,6 +77,23 @@ class X402Paywall:
         if scope["type"] != "http":
             return await self.app(scope, receive, send)
 
+        # LOG FIRST. Before any branch, before any early return.
+        #
+        # I put this after the probe check, and the probe check returns a 402 — so requests
+        # classified as probes never logged, and the one diagnostic I asked for came back
+        # "no matching log". An instrument that sits downstream of an early return is not an
+        # instrument. Nothing above this line can prevent it firing.
+        #
+        # Header NAMES only, never values: the payment envelope carries a signature.
+        _path = scope.get("path", "")
+        if _path.rstrip("/").endswith("/mcp") or _path.rstrip("/") == "/mcp":
+            try:
+                _names = sorted({k.decode().lower() for k, _ in scope.get("headers", [])})
+                log.info("INBOUND %s %s | headers: %s",
+                         scope.get("method"), _path, ",".join(_names))
+            except Exception:
+                pass
+
         # The plain-HTTP x402 door (/x402/*) handles its OWN payment lifecycle end-to-end
         # (see http_x402.py). The MCP paywall must not touch it, or it would double-gate the
         # request — issue a 402 for a call that already carries its own settled payment. Two
@@ -135,19 +152,22 @@ class X402Paywall:
         _p = scope.get("path", "").rstrip("/")
         _is_mcp = _p.endswith("/mcp") or _p == "/mcp"
 
+        if _is_mcp:
+            _log_headers(scope)
+
         if _is_mcp and not _accepts_sse(scope):
-            if _header(scope, b"x-payment"):
+            if _payment_header(scope):
                 # Paid replay from a plain-HTTP buyer -> serve the verdict as stateless JSON.
                 rewritten = dict(scope)
                 rewritten["path"] = "/x402/verify"
                 rewritten["raw_path"] = b"/x402/verify"
-                log.info("plain-HTTP buyer (no SSE) with payment -> /x402/verify")
+                log.info("plain-HTTP buyer WITH payment -> /x402/verify (settlement will run)")
                 return await self.app(rewritten, _replay(body, receive), send)
 
             # No payment yet -> the x402 challenge. Also stateless JSON.
             price, desc = self.paid.get("verify_deliverable", (next(iter(self.paid.values()))))
             reqs = self.fac.requirements(resource_url=self.resource_url, description=desc, price=price)
-            log.info("plain-HTTP buyer (no SSE), unpaid -> 402 challenge")
+            log.warning("plain-HTTP buyer with NO recognised payment header -> 402 challenge. If the buyer believes it paid, its header name is not in _payment_header().")
             return await _402(send, self.fac.challenge_header(reqs), reqs)
 
         # Everything below here is a real MCP client (it accepts text/event-stream).
@@ -202,7 +222,7 @@ class X402Paywall:
         reqs = self.fac.requirements(
             resource_url=self.resource_url, description=description, price=price
         )
-        x_payment = _header(scope, b"x-payment")
+        x_payment = _payment_header(scope)
 
         if not x_payment:
             return await _402(send, self.fac.challenge_header(reqs), reqs)
@@ -280,7 +300,8 @@ class X402Paywall:
         # Without this, a buyer who signals x402 in its headers AND pays would be re-challenged
         # forever, having already settled on-chain.
         for k, v in scope.get("headers", []):
-            if k.lower() == b"x-payment" and v:
+            if k.lower() in (b"x-payment", b"payment", b"x-payment-authorization",
+                             b"x-402-payment", b"x402-payment") and v:
                 return False
 
         if scope["method"] == "GET":
@@ -293,6 +314,40 @@ class X402Paywall:
 
 
 # ── ASGI plumbing ────────────────────────────────────────────────────────────
+
+def _payment_header(scope: Scope) -> str | None:
+    """
+    Find the payment envelope under ANY header name a buyer might use.
+
+    I assumed `X-PAYMENT` (the x402 spec name) and gated everything on it. But OKX's
+    `onchainos payment pay` returns an `authorization_header` value AND a `header_name` —
+    which means the name is not fixed, and a buyer sending it under a different name looked
+    to us exactly like a buyer who had not paid at all. We answered 402, they replayed, we
+    answered 402, forever. The settlement code never ran, which is why no rejection was ever
+    logged: there was nothing to reject.
+
+    So: accept every plausible name. A payment we fail to recognise is worse than one we
+    recognise and reject — the second at least tells everyone what happened.
+    """
+    names = (
+        b"x-payment", b"payment", b"x-payment-authorization", b"authorization-payment",
+        b"x-402-payment", b"x402-payment", b"payment-authorization",
+    )
+    for k, v in scope.get("headers", []):
+        if k.lower() in names and v:
+            return v.decode()
+    return None
+
+
+def _log_headers(scope: Scope) -> None:
+    """Log header NAMES only (never values — they carry signatures) so we can see what a
+    buyer actually sends without ever guessing again."""
+    try:
+        names = sorted({k.decode().lower() for k, _ in scope.get("headers", [])})
+        log.info("inbound /mcp POST headers: %s", ",".join(names))
+    except Exception:
+        pass
+
 
 def _accepts_sse(scope: Scope) -> bool:
     """True if the client accepts text/event-stream — i.e. it is a real MCP streamable-HTTP
